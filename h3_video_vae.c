@@ -50,6 +50,15 @@ typedef struct {
     h3_gpu_tensor *w2;
     h3_gpu_tensor *w2_b;
     h3_gpu_tensor *scale2;
+    /* Optional BF16 copies of the MLP for the H3_VAE_BF16_MLP path. */
+    h3_gpu_tensor *w1_bf16;
+    h3_gpu_tensor *w1_b_bf16;
+    h3_gpu_tensor *w2_bf16;
+    h3_gpu_tensor *w2_b_bf16;
+    h3_gpu_tensor *qkv_w_bf16;
+    h3_gpu_tensor *qkv_b_bf16;
+    h3_gpu_tensor *out_w_bf16;
+    h3_gpu_tensor *out_b_bf16;
 } vae_block;
 
 typedef struct {
@@ -81,6 +90,19 @@ typedef struct {
     h3_gpu_tensor *rope_cos;
     h3_gpu_tensor *rope_sin;
     h3_gpu_tensor *projected;
+    /* H3_VAE_BF16_MLP: the two MLP matmuls (2/3 of the decoder's FLOPs) run
+     * in BF16 on MPS instead of F32. The residual stream, norms and attention
+     * stay F32, so the drift is bounded to the MLP branch. */
+    int bf16_mlp;
+    h3_gpu_tensor *norm_bf16;
+    h3_gpu_tensor *ff1_bf16;
+    h3_gpu_tensor *activated_bf16;
+    h3_gpu_tensor *branch_bf16;
+    h3_gpu_tensor *qkv_bf16;
+    h3_gpu_tensor *heads_bf16;
+    h3_gpu_tensor *query_bf16;
+    h3_gpu_tensor *key_bf16;
+    h3_gpu_tensor *value_bf16;
     uint32_t patches;
     uint32_t sequence;
     int latent_h;
@@ -145,6 +167,10 @@ static void free_block(vae_block *block) {
     free_tensor(&block->norm2); free_tensor(&block->w1);
     free_tensor(&block->w1_b); free_tensor(&block->w2);
     free_tensor(&block->w2_b); free_tensor(&block->scale2);
+    free_tensor(&block->w1_bf16); free_tensor(&block->w1_b_bf16);
+    free_tensor(&block->w2_bf16); free_tensor(&block->w2_b_bf16);
+    free_tensor(&block->qkv_w_bf16); free_tensor(&block->qkv_b_bf16);
+    free_tensor(&block->out_w_bf16); free_tensor(&block->out_b_bf16);
 }
 
 static void cleanup(vae_context *vae) {
@@ -161,6 +187,11 @@ static void cleanup(vae_context *vae) {
     free_tensor(&vae->branch); free_tensor(&vae->ff1);
     free_tensor(&vae->activated); free_tensor(&vae->rope_cos);
     free_tensor(&vae->rope_sin); free_tensor(&vae->projected);
+    free_tensor(&vae->norm_bf16); free_tensor(&vae->ff1_bf16);
+    free_tensor(&vae->activated_bf16); free_tensor(&vae->branch_bf16);
+    free_tensor(&vae->qkv_bf16); free_tensor(&vae->heads_bf16);
+    free_tensor(&vae->query_bf16); free_tensor(&vae->key_bf16);
+    free_tensor(&vae->value_bf16);
     h3_gpu_free(vae->gpu);
     h3_weight_store_free(vae->weights);
     memset(vae, 0, sizeof(*vae));
@@ -420,35 +451,150 @@ static int allocate_activations(vae_context *vae, char *error,
     return 1;
 }
 
+/* Build the BF16 MLP copies and activations when H3_VAE_BF16_MLP is set.
+ * The checkpoint stores the VAE in F32, so the cast happens on the GPU once
+ * per load: 36 blocks x (16384x2048 + 2048x8192) = 3.6 GB of BF16 weights. */
+static int prepare_bf16_mlp(vae_context *vae, char *error, size_t error_size) {
+    const char *flag = getenv("H3_VAE_BF16_MLP");
+    vae->bf16_mlp = flag && *flag && strcmp(flag, "0") != 0;
+    if (!vae->bf16_mlp) return 1;
+    size_t sequence = vae->sequence;
+    vae->norm_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * HIDDEN);
+    vae->ff1_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * FFN * 2);
+    vae->activated_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * FFN);
+    vae->branch_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * HIDDEN);
+    vae->qkv_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * INNER * 3);
+    vae->heads_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * INNER);
+    vae->query_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * INNER);
+    vae->key_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * INNER);
+    vae->value_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * INNER);
+    if (!vae->norm_bf16 || !vae->ff1_bf16 || !vae->activated_bf16 ||
+        !vae->branch_bf16 || !vae->qkv_bf16 || !vae->heads_bf16 ||
+        !vae->query_bf16 || !vae->key_bf16 || !vae->value_bf16) {
+        fail(error, error_size, "cannot allocate BF16 video VAE activations: %s",
+             h3_gpu_error(vae->gpu));
+        return 0;
+    }
+    if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                "begin video VAE BF16 weight cast")) return 0;
+    for (int index = 0; index < LAYERS; index++) {
+        vae_block *b = &vae->blocks[index];
+        b->w1_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, (size_t)FFN * 2 * HIDDEN);
+        b->w1_b_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, (size_t)FFN * 2);
+        b->w2_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, (size_t)HIDDEN * FFN);
+        b->w2_b_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, HIDDEN);
+        b->qkv_w_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, (size_t)INNER * 3 * HIDDEN);
+        b->qkv_b_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, (size_t)INNER * 3);
+        b->out_w_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, (size_t)HIDDEN * INNER);
+        b->out_b_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, HIDDEN);
+        if (!b->w1_bf16 || !b->w1_b_bf16 || !b->w2_bf16 || !b->w2_b_bf16 ||
+            !b->qkv_w_bf16 || !b->qkv_b_bf16 || !b->out_w_bf16 || !b->out_b_bf16) {
+            fail(error, error_size, "cannot allocate BF16 video VAE MLP weights: %s",
+                 h3_gpu_error(vae->gpu));
+            return 0;
+        }
+#define CAST(dst, src, n) do {                                                  \
+    if (!gpu_op(vae, h3_gpu_cast_f32_to_bf16(vae->gpu, (dst), (src), (n)),    \
+                error, error_size, "video VAE MLP weight cast")) return 0;     \
+} while (0)
+        CAST(b->w1_bf16, b->w1, (uint32_t)((size_t)FFN * 2 * HIDDEN));
+        CAST(b->w1_b_bf16, b->w1_b, FFN * 2);
+        CAST(b->w2_bf16, b->w2, (uint32_t)((size_t)HIDDEN * FFN));
+        CAST(b->w2_b_bf16, b->w2_b, HIDDEN);
+        CAST(b->qkv_w_bf16, b->qkv_w, (uint32_t)((size_t)INNER * 3 * HIDDEN));
+        CAST(b->qkv_b_bf16, b->qkv_b, INNER * 3);
+        CAST(b->out_w_bf16, b->out_w, (uint32_t)((size_t)HIDDEN * INNER));
+        CAST(b->out_b_bf16, b->out_b, HIDDEN);
+#undef CAST
+    }
+    if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                "submit video VAE BF16 weight cast")) return 0;
+    /* The F32 originals are no longer read by run_block on this path. */
+    for (int index = 0; index < LAYERS; index++) {
+        free_tensor(&vae->blocks[index].w1);
+        free_tensor(&vae->blocks[index].w2);
+        free_tensor(&vae->blocks[index].qkv_w);
+        free_tensor(&vae->blocks[index].out_w);
+    }
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: video VAE MLP, attention projections and SDPA in BF16\n");
+    return 1;
+}
+
 static int run_block(vae_context *vae, int index, char *error,
                      size_t error_size) {
     vae_block *weight = &vae->blocks[index];
     uint32_t rows = vae->sequence;
+
 #define OP(call, label) do {                                                    \
     if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
 } while (0)
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm1,
         rows, HIDDEN, 1e-5f), "video VAE attention norm");
+    if (vae->bf16_mlp) {
+        /* QKV projection in BF16; the fused QK-norm/RoPE kernel is F32-only,
+         * so the packed QKV is cast back before it. */
+        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
+            rows * HIDDEN), "video VAE QKV input cast");
+        OP(h3_gpu_linear_bf16(vae->gpu, vae->qkv_bf16, vae->norm_bf16,
+            weight->qkv_w_bf16, (weight->qkv_b_bf16), rows, HIDDEN, INNER * 3),
+           "video VAE QKV (BF16)");
+        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->qkv, vae->qkv_bf16,
+            rows * INNER * 3), "video VAE QKV output cast");
+    } else
     OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
         weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
     OP(h3_gpu_video_qkv_rope_f32(vae->gpu, vae->query, vae->key, vae->value,
         vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
         ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
+    if (vae->bf16_mlp) {
+        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->query_bf16, vae->query,
+            rows * INNER), "video VAE query cast");
+        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->key_bf16, vae->key,
+            rows * INNER), "video VAE key cast");
+        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->value_bf16, vae->value,
+            rows * INNER), "video VAE value cast");
+        OP(h3_gpu_sdpa_bf16(vae->gpu, vae->heads_bf16, vae->query_bf16,
+            vae->key_bf16, vae->value_bf16, rows, HEADS, HEAD_DIM,
+            1.0f / sqrtf((float)HEAD_DIM)), "video VAE attention (BF16)");
+    } else
     OP(h3_gpu_sdpa_f32(vae->gpu, vae->heads, vae->query, vae->key, vae->value,
         rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "video VAE attention");
+    if (vae->bf16_mlp) {
+        OP(h3_gpu_linear_bf16(vae->gpu, vae->branch_bf16, vae->heads_bf16,
+            weight->out_w_bf16, (weight->out_b_bf16), rows, INNER, HIDDEN),
+           "video VAE attention output (BF16)");
+        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->branch, vae->branch_bf16,
+            rows * HIDDEN), "video VAE attention output cast back");
+    } else
     OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
         weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
     OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
+    if (vae->bf16_mlp) {
+        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
+            rows * HIDDEN), "video VAE MLP input cast");
+        OP(h3_gpu_linear_bf16(vae->gpu, vae->ff1_bf16, vae->norm_bf16,
+            weight->w1_bf16, (weight->w1_b_bf16), rows, HIDDEN, FFN * 2),
+           "video VAE MLP input (BF16)");
+        OP(h3_gpu_swiglu_bf16(vae->gpu, vae->activated_bf16, vae->ff1_bf16,
+            rows, FFN), "video VAE SwiGLU (BF16)");
+        OP(h3_gpu_linear_bf16(vae->gpu, vae->branch_bf16, vae->activated_bf16,
+            weight->w2_bf16, (weight->w2_b_bf16), rows, FFN, HIDDEN),
+           "video VAE MLP output (BF16)");
+        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->branch, vae->branch_bf16,
+            rows * HIDDEN), "video VAE MLP output cast");
+    } else {
     OP(h3_gpu_linear_f32(vae->gpu, vae->ff1, vae->norm, weight->w1,
         weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
     OP(h3_gpu_swiglu_f32(vae->gpu, vae->activated, vae->ff1, rows, FFN),
        "video VAE SwiGLU");
     OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->activated, weight->w2,
         weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+    }
     OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
 #undef OP
@@ -941,7 +1087,8 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
              load_resident_weights(vae, progress, progress_opaque,
                                    error, error_size) &&
              prepare_rope(vae, error, error_size) &&
-             allocate_activations(vae, error, error_size);
+             allocate_activations(vae, error, error_size) &&
+             prepare_bf16_mlp(vae, error, error_size);
     }
     if (!ok) {
         h3_video_vae_decoder_free(decoder);
@@ -1086,7 +1233,8 @@ static int decode_chunked(const char *weight_directory,
          load_resident_weights(&vae, progress, progress_opaque,
                                error, error_size) &&
          prepare_rope(&vae, error, error_size) &&
-         allocate_activations(&vae, error, error_size);
+         allocate_activations(&vae, error, error_size) &&
+         prepare_bf16_mlp(&vae, error, error_size);
     int tile_count = y_axis.count * x_axis.count;
     int chunks = (latent_time - 2) / 5;
     int output_frames = chunks * 17 + 5;
@@ -1244,6 +1392,7 @@ int h3_video_vae_decode(const char *weight_directory,
                       error, error_size) &&
         prepare_rope(&vae, error, error_size) &&
         allocate_activations(&vae, error, error_size) &&
+         prepare_bf16_mlp(&vae, error, error_size) &&
         run_decoder(&vae, progress, progress_opaque, error, error_size) &&
         unpack_frames(&vae, output, error, error_size);
     if (!ok) h3_video_frames_free(output);
