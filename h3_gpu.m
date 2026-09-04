@@ -1655,6 +1655,11 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"SDPA tensor dtype mismatch");
         return 0;
     }
+    /* Profiling probe: H3_SKIP_ATTN=1 leaves the output untouched so the
+     * remaining per-pass time is everything except attention. Output is garbage. */
+    static int skip_attn = -1;
+    if (skip_attn < 0) skip_attn = getenv("H3_SKIP_ATTN") != NULL;
+    if (skip_attn) return 1;
     if (gpu.steelLibrary && tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
         (head_dim == 64 || head_dim == 96 || head_dim == 128))
         return h3_gpu_sdpa_steel(gpu, output, query, key, value, sequence, heads,
