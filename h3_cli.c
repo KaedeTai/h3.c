@@ -303,6 +303,36 @@ static void list_references(const h3_cli_state *state) {
     }
 }
 
+int h3_warn_ref2va_knobs(const h3_params *params) {
+    int images = 0;
+    for (size_t index = 0; index < params->reference_count; index++)
+        if (params->references[index].kind == H3_REFERENCE_IMAGE) images++;
+    if (!images || (params->core_reuse <= 1 && !params->token_reduction))
+        return 0;
+    fprintf(stderr, "h3: warning: Ref2VA image references with");
+    if (params->core_reuse > 1)
+        fprintf(stderr, " --core-reuse %d", params->core_reuse);
+    if (params->core_reuse > 1 && params->token_reduction)
+        fprintf(stderr, " and");
+    if (params->token_reduction)
+        fprintf(stderr, " --token-reduction");
+    fprintf(stderr, "\n");
+    if (params->core_reuse > 1)
+        fprintf(stderr,
+            "h3: warning: core reuse skips the blocks that align video tokens "
+            "to the reference; with the 4-step turbo LoRA every value (2, 3, "
+            "4) produced a smeared UI and a glowing subject\n");
+    if (params->token_reduction)
+        fprintf(stderr,
+            "h3: warning: token reduction merges neighbouring video tokens "
+            "and doubled limbs in Ref2VA turbo tests; use it only if slight "
+            "ghosting is acceptable\n");
+    fprintf(stderr,
+        "h3: warning: measured Ref2VA-safe fast setting is --steps 4 with the "
+        "turbo LoRA plus --use-int8-row-fc2 only\n");
+    return 1;
+}
+
 static void add_reference_image(h3_cli_state *state, char *argument) {
     argument = skip_spaces(argument);
     if (!*argument) {
@@ -445,6 +475,7 @@ static int generate(h3_cli_state *state, const char *prompt) {
     state->display_failed = 0;
     printf("Seed: %" PRIu64 "\n", params.seed);
     fflush(stdout);
+    h3_warn_ref2va_knobs(&params);
     struct timespec begin, end;
     clock_gettime(CLOCK_MONOTONIC, &begin);
     h3_result *result = h3_generate(state->ctx, prompt, &params);

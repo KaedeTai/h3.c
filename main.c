@@ -480,6 +480,7 @@ int main(int argc, char **argv) {
     }
     params.references = references;
     params.reference_count = reference_count;
+    if (prompt) h3_warn_ref2va_knobs(&params);
     if (cli.frames_dir && mkdir(cli.frames_dir, 0755) != 0 &&
         errno != EEXIST) {
         fprintf(stderr, "h3: cannot create frames directory %s: %s\n",
