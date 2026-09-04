@@ -1,0 +1,40 @@
+# steel/ — MLX steel attention inside h3-metal
+
+`h3_steel_attention.metal` is a flattened copy of ml-explore/mlx's NAX
+(M5 TensorOps) full-attention kernel: `steel/attn/kernels/steel_attention_nax.h`
+plus the headers it needs, with the mlx includes inlined and three explicit
+instantiations (bf16, bq64/bk32, head_dim 64/96/128, wm4/wn1). It is loaded as
+a second `MTLLibrary` when `H3_STEEL_ATTN=1` is set and `h3_gpu_sdpa()` routes
+bf16, non-causal, batch-1 attention with head_dim 64/96/128 to it. Both input
+layouts h3-metal uses ([N,H,D] row major and [H,N,D] head major) are expressed
+as strides, so the MPSGraph transposes disappear.
+
+Numerically verified against a CPU fp32 reference: max |diff| 0.00014 on
+N=1000, H=4, D=96 for both output layouts. A 4-step turbo render with the same
+seed comes out at 26 dB PSNR against the MPSGraph path — same scene and
+composition, different fine detail — which is bf16 accumulation order amplified
+by four sampler steps, not an error.
+
+## Shapes that actually matter here
+
+* DiT: 56 heads x **128** (inner 7168, qkv 21504). Not 5376/56 = 96.
+* Video VAE: 32 heads x 64, sequence ~1801 per tile-chunk.
+* Text refiner: 128.
+
+## How to measure attention kernels on M5 Max (learned the hard way)
+
+Short kernels are dominated by GPU clock state, not code:
+
+* One process after idle runs at boost clocks; the next back-to-back process
+  is already throttled. head_dim 64 at 68 ms/call barely moves; head_dim 96
+  at 300 ms/call went 42 -> 17 TFLOPS between two consecutive processes of
+  the *same* binary.
+* So: alternate builds, `sleep 60` before every run, compare position-matched
+  pairs, and report sustained (75 s of calls, mean of the last 30 s) separately
+  from burst. Burst and sustained can disagree on the sign of a change.
+* The "head_dim 96 is 3x slower" and "head_dim 128 is only 20 TFLOPS" numbers
+  measured earlier in this project were both artefacts of run order. Paired:
+  64 -> 52, 96 -> 42 (51 with the MLX unroll fix), 128 -> 44 TFLOPS burst.
+
+Compile of the specialised pipelines (function constants) costs ~7 s on first
+use per shape and is cached by Metal across processes; time the second run.

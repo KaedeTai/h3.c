@@ -117,6 +117,10 @@
 @property(nonatomic) BOOL tensorOpsEnabled;
 @property(nonatomic) NSUInteger tensorOpsMode;
 @property(nonatomic) BOOL headMajorSDPAInputs;
+/* MLX steel attention (M5 TensorOps), compiled from steel/h3_steel_attention.metal.
+ * Pipelines are specialised per (kernel, align_Q, align_K) through function constants. */
+@property(nonatomic, strong) id<MTLLibrary> steelLibrary;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *steelPipelines;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
@@ -371,6 +375,27 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                                                    options:options
                                                      error:&libraryError];
             gpu.tensorOpsEnabled = gpu.library && wantsTensorOps;
+            if (gpu.tensorOpsEnabled && getenv("H3_STEEL_ATTN")) {
+                NSString *steelPath = [[path stringByDeletingLastPathComponent]
+                    stringByAppendingPathComponent:@"steel/h3_steel_attention.metal"];
+                if (![path containsString:@"/"])
+                    steelPath = @"steel/h3_steel_attention.metal";
+                NSError *steelError = nil;
+                NSString *steelSource = [NSString stringWithContentsOfFile:steelPath
+                                                                  encoding:NSUTF8StringEncoding
+                                                                     error:&steelError];
+                MTLCompileOptions *steelOptions = [[MTLCompileOptions alloc] init];
+                steelOptions.mathMode = MTLMathModeSafe;
+                gpu.steelLibrary = steelSource ?
+                    [gpu.device newLibraryWithSource:steelSource options:steelOptions
+                                               error:&steelError] : nil;
+                gpu.steelPipelines = [NSMutableDictionary dictionary];
+                if (!gpu.steelLibrary)
+                    fprintf(stderr, "h3: steel attention library unavailable: %s\n",
+                            steelError.localizedDescription.UTF8String);
+                else if (getenv("H3_PROFILE"))
+                    fprintf(stderr, "h3: steel attention library loaded\n");
+            }
             if (gpu.tensorOpsEnabled) {
                 const char *mode = nax && *nax ? nax : "qkv-attn";
                 gpu.tensorOpsMode = !strcmp(mode, "attn") ? 2u :
@@ -1519,6 +1544,94 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
     }
 }
 
+/* MLX steel_attention_nax parameters (mlx/backend/metal/kernels/steel/attn/params.h). */
+typedef struct {
+    int B, H, D, qL, kL, gqa_factor;
+    float scale;
+    int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+    int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+} h3_steel_attn_params;
+
+static id<MTLComputePipelineState> h3_gpu_steel_pipeline(H3GPU *gpu, NSString *base,
+                                                         BOOL alignQ, BOOL alignK) {
+    NSString *key = [NSString stringWithFormat:@"%@_%d%d", base, alignQ, alignK];
+    id<MTLComputePipelineState> pipeline = gpu.steelPipelines[key];
+    if (pipeline) return pipeline;
+    MTLFunctionConstantValues *consts = [[MTLFunctionConstantValues alloc] init];
+    BOOL f = NO;
+    [consts setConstantValue:&alignQ type:MTLDataTypeBool atIndex:200];
+    [consts setConstantValue:&alignK type:MTLDataTypeBool atIndex:201];
+    [consts setConstantValue:&f type:MTLDataTypeBool atIndex:300];   /* has_mask */
+    [consts setConstantValue:&f type:MTLDataTypeBool atIndex:301];   /* do_causal */
+    [consts setConstantValue:&f type:MTLDataTypeBool atIndex:302];   /* has_sinks */
+    NSError *error = nil;
+    NSTimeInterval t0 = [NSDate timeIntervalSinceReferenceDate];
+    id<MTLFunction> function = [gpu.steelLibrary newFunctionWithName:base
+                                                      constantValues:consts
+                                                               error:&error];
+    pipeline = function ? [gpu.device newComputePipelineStateWithFunction:function
+                                                                    error:&error] : nil;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: steel attention pipeline %s specialised in %.2fs\n",
+                key.UTF8String, [NSDate timeIntervalSinceReferenceDate] - t0);
+    if (!pipeline) {
+        h3_gpu_set_error(gpu, @"steel attention pipeline %@: %@", key,
+                         error.localizedDescription);
+        return nil;
+    }
+    gpu.steelPipelines[key] = pipeline;
+    return pipeline;
+}
+
+/* Full self-attention through the MLX steel NAX kernel. Inputs are either
+ * [N, H, D] (row major) or [H, N, D] (head major); the kernel takes both as
+ * strides, so neither layout needs the transposes the MPSGraph path does. */
+static int h3_gpu_sdpa_steel(H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                             const h3_gpu_tensor *value, uint32_t sequence,
+                             uint32_t heads, uint32_t head_dim, float scale,
+                             int inputHeadMajor, int outputHeadMajor) {
+    const int bq = 64, bk = 32;
+    NSString *base = [NSString stringWithFormat:
+        @"h3_steel_attention_bfloat16_bq64_bk32_bd%u_wm4_wn1", head_dim];
+    BOOL alignQ = (sequence % bq) == 0, alignK = (sequence % bk) == 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_steel_pipeline(gpu, base, alignQ, alignK);
+    if (!pipeline) return 0;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    int64_t N = sequence, H = heads, D = head_dim;
+    int64_t rowMajor[3] = {N * H * D, D, H * D};     /* (B, H, L) strides of [N,H,D] */
+    int64_t headMajor[3] = {H * N * D, N * D, D};    /* (B, H, L) strides of [H,N,D] */
+    const int64_t *in = inputHeadMajor ? headMajor : rowMajor;
+    const int64_t *out = outputHeadMajor ? headMajor : rowMajor;
+    h3_steel_attn_params params = {
+        .B = 1, .H = (int)heads, .D = (int)head_dim, .qL = (int)sequence,
+        .kL = (int)sequence, .gqa_factor = 1, .scale = scale,
+        .NQ = (int)((sequence + bq - 1) / bq), .NK = (int)((sequence + bk - 1) / bk),
+        .NQ_aligned = (int)(sequence / bq), .NK_aligned = (int)(sequence / bk),
+        .qL_rem = (int)(sequence % bq), .kL_rem = (int)(sequence % bk), .qL_off = 0,
+    };
+    memcpy(params.Q_strides, in, sizeof(params.Q_strides));
+    memcpy(params.K_strides, in, sizeof(params.K_strides));
+    memcpy(params.V_strides, in, sizeof(params.V_strides));
+    memcpy(params.O_strides, out, sizeof(params.O_strides));
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(params.NQ, heads, 1)
+               threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
@@ -1542,6 +1655,10 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_set_error(gpu, @"SDPA tensor dtype mismatch");
         return 0;
     }
+    if (gpu.steelLibrary && tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
+        (head_dim == 64 || head_dim == 96 || head_dim == 128))
+        return h3_gpu_sdpa_steel(gpu, output, query, key, value, sequence, heads,
+                                 head_dim, scale, headMajor, outputHeadMajor);
     H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
                                       scale, mps_dtype, causal, headMajor,
                                       outputHeadMajor);
