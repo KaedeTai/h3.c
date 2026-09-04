@@ -79,3 +79,25 @@ Adding `H3_VAE_INT8_FFN=1` in High Power: VAE 89 -> 70 s, wall 402.5 s.
 With post-processing on the same machine (RIFE 6 s + Real-ESRGAN 51 s +
 ffmpeg 6 s) the whole 15 s timelapse pipeline is ~465 s, level with the
 RTX 3090 reference workflow (300 + 181 s).
+
+## Ref2VA turbo (lightx2v ref2v 4-step v0.1)
+
+Byte-patched into `MiniMax-H3-turbo/Ref2VA` with
+`~/repos/mtp-cn-tune/patch_h3_turbo.py` (`H3_VARIANT=Ref2VA H3_LORA=...`).
+All 208 LoRA modules map onto the Ref2VA checkpoint; rank 128 (qkv fused
+384), alpha/rank = 0.0625 as the file's metadata says. The delta is 10-30x
+smaller in norm than the FL2V v1.1 768p merge, but it works: base Ref2VA at
+4 steps is a blur, the LoRA'd model at 4 steps is clean.
+
+What breaks it is `--core-reuse 4`: with the reference tokens in the stream,
+skipping the core blocks turns the UI into a smear and the subject into a
+blue glow. `--token-reduction` is usable but ghosts limbs slightly;
+`--use-int8-row-fc2` is harmless. 3 s @1152x640: no knobs 141 s, core-reuse
+84 s (broken), token-reduction 92 s, int8 fc2 133 s.
+
+15 s @1152x640, 4 steps, int8 fc2 only, int8 VAE, steel, High Power:
+DiT 1339 s + VAE 265 s = 1634 s wall (original Ref2VA 8-step run: 3515 s;
+FL2VA turbo with all knobs: 402 s). The VAE took 265 s here against 70 s
+after the shorter FL2VA denoise with identical settings - the machine was
+22 minutes into sustained load, so High Power does not remove throttling,
+it only raises the ceiling.
