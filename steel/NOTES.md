@@ -38,3 +38,25 @@ Short kernels are dominated by GPU clock state, not code:
 
 Compile of the specialised pipelines (function constants) costs ~7 s on first
 use per shape and is cached by Metal across processes; time the second run.
+
+## Video VAE FFN in int8 (`H3_VAE_INT8_FFN=1`)
+
+Opt-in, implies `H3_VAE_BF16_MLP`. The two FFN matmuls (w1 2048->16384,
+w2 8192->2048, ~2/3 of the decoder's FLOPs) run on the existing M5 int8 NAX
+linear (`h3_gpu_linear_int8_bf16`: per-output-channel weight scale, dynamic
+per-row activation scale). The int8 kernel has no bias input, so the biases
+come back through two small kernels, `h3_swiglu_bias_bf16` and
+`h3_bias_add_bf16`. Attention projections and SDPA stay BF16.
+
+* Isolated, sustained (2500 blocks back to back, M=1801): BF16 MPS path
+  3.55 ms/block, int8 2.05 ms/block. w1 alone 64 -> 107 TFLOPS, w2 61 -> 91.
+* Real decode, 1152x640: 1 s clip 10.1 -> 7.8 s; 3 s clip 19.3 -> 14.9 s
+  (paired, 120 s cooldown between runs, int8 first). About -22%.
+* Quality: 3 s, same seed, against the F32 decoder: int8 42.5 dB / SSIM
+  0.984 vs BF16 43.4 dB / 0.986. Deterministic run to run.
+* Weight prep (cast + quantization of 36 blocks) 0.27 s.
+
+The first A/B of this path looked like a 2 s *loss*. It was run order: the
+BF16 reference went first on a cold machine and the identical DiT in the same
+logs drifted 23.8 -> 27.2 s across four runs. With 120 s cooldowns the same
+DiT measures 14.8 s in every run. Same lesson as the attention kernels above.

@@ -3794,6 +3794,40 @@ kernel void h3_swiglu_bf16(device const ushort *fused [[buffer(0)]],
         h3_f32_to_bf16(gate / (1.0f + exp(-gate)) * up);
 }
 
+/* SwiGLU over a fused [rows, 2*width] BF16 tensor whose projection was
+ * produced without its bias (int8 NAX linear has no bias input); the bias
+ * is added here before the activation. */
+kernel void h3_swiglu_bias_bf16(device const ushort *fused [[buffer(0)]],
+                                device const ushort *bias [[buffer(1)]],
+                                device ushort *output [[buffer(2)]],
+                                constant swiglu_args &args [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint base = row * args.width * 2;
+    float gate = h3_bf16_to_f32(fused[base + column]) +
+                 h3_bf16_to_f32(bias[column]);
+    float up = h3_bf16_to_f32(fused[base + args.width + column]) +
+               h3_bf16_to_f32(bias[args.width + column]);
+    output[row * args.width + column] =
+        h3_f32_to_bf16(gate / (1.0f + exp(-gate)) * up);
+}
+
+/* output[row, col] = input[row, col] + bias[col]; output may alias input. */
+kernel void h3_bias_add_bf16(device const ushort *input [[buffer(0)]],
+                             device const ushort *bias [[buffer(1)]],
+                             device ushort *output [[buffer(2)]],
+                             constant swiglu_args &args [[buffer(3)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint index = row * args.width + column;
+    output[index] = h3_f32_to_bf16(h3_bf16_to_f32(input[index]) +
+                                   h3_bf16_to_f32(bias[column]));
+}
+
 struct embedding_args {
     uint tokens;
     uint vocab_size;

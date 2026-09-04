@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     LATENT_CHANNELS = 24,
@@ -59,6 +60,11 @@ typedef struct {
     h3_gpu_tensor *qkv_b_bf16;
     h3_gpu_tensor *out_w_bf16;
     h3_gpu_tensor *out_b_bf16;
+    /* H3_VAE_INT8_FFN: int8 (per-output-channel scale) copies of w1/w2. */
+    h3_gpu_tensor *w1_int8;
+    h3_gpu_tensor *w1_scales;
+    h3_gpu_tensor *w2_int8;
+    h3_gpu_tensor *w2_scales;
 } vae_block;
 
 typedef struct {
@@ -103,6 +109,11 @@ typedef struct {
     h3_gpu_tensor *query_bf16;
     h3_gpu_tensor *key_bf16;
     h3_gpu_tensor *value_bf16;
+    /* H3_VAE_INT8_FFN (implies BF16 MLP): the two FFN matmuls run on the M5
+     * int8 NAX tensor path with dynamic per-row activation scales. */
+    int int8_ffn;
+    h3_gpu_tensor *int8_activation;
+    h3_gpu_tensor *int8_scales;
     uint32_t patches;
     uint32_t sequence;
     int latent_h;
@@ -171,6 +182,8 @@ static void free_block(vae_block *block) {
     free_tensor(&block->w2_bf16); free_tensor(&block->w2_b_bf16);
     free_tensor(&block->qkv_w_bf16); free_tensor(&block->qkv_b_bf16);
     free_tensor(&block->out_w_bf16); free_tensor(&block->out_b_bf16);
+    free_tensor(&block->w1_int8); free_tensor(&block->w1_scales);
+    free_tensor(&block->w2_int8); free_tensor(&block->w2_scales);
 }
 
 static void cleanup(vae_context *vae) {
@@ -192,6 +205,7 @@ static void cleanup(vae_context *vae) {
     free_tensor(&vae->qkv_bf16); free_tensor(&vae->heads_bf16);
     free_tensor(&vae->query_bf16); free_tensor(&vae->key_bf16);
     free_tensor(&vae->value_bf16);
+    free_tensor(&vae->int8_activation); free_tensor(&vae->int8_scales);
     h3_gpu_free(vae->gpu);
     h3_weight_store_free(vae->weights);
     memset(vae, 0, sizeof(*vae));
@@ -451,12 +465,21 @@ static int allocate_activations(vae_context *vae, char *error,
     return 1;
 }
 
+static double vae_now(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
 /* Build the BF16 MLP copies and activations when H3_VAE_BF16_MLP is set.
  * The checkpoint stores the VAE in F32, so the cast happens on the GPU once
  * per load: 36 blocks x (16384x2048 + 2048x8192) = 3.6 GB of BF16 weights. */
 static int prepare_bf16_mlp(vae_context *vae, char *error, size_t error_size) {
     const char *flag = getenv("H3_VAE_BF16_MLP");
-    vae->bf16_mlp = flag && *flag && strcmp(flag, "0") != 0;
+    const char *int8_flag = getenv("H3_VAE_INT8_FFN");
+    vae->int8_ffn = int8_flag && *int8_flag && strcmp(int8_flag, "0") != 0 &&
+        h3_gpu_has_int8_mlp(vae->gpu);
+    vae->bf16_mlp = (flag && *flag && strcmp(flag, "0") != 0) || vae->int8_ffn;
     if (!vae->bf16_mlp) return 1;
     size_t sequence = vae->sequence;
     vae->norm_bf16 = h3_gpu_tensor_new_bf16(vae->gpu, sequence * HIDDEN);
@@ -475,6 +498,7 @@ static int prepare_bf16_mlp(vae_context *vae, char *error, size_t error_size) {
              h3_gpu_error(vae->gpu));
         return 0;
     }
+    double prep_start = vae_now();
     if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
                 "begin video VAE BF16 weight cast")) return 0;
     for (int index = 0; index < LAYERS; index++) {
@@ -509,6 +533,47 @@ static int prepare_bf16_mlp(vae_context *vae, char *error, size_t error_size) {
     }
     if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
                 "submit video VAE BF16 weight cast")) return 0;
+    if (vae->int8_ffn) {
+        uint32_t padded = (uint32_t)((sequence + 127u) & ~(size_t)127u);
+        vae->int8_activation = h3_gpu_tensor_new_i8(vae->gpu,
+            (size_t)padded * FFN);
+        vae->int8_scales = h3_gpu_tensor_new_f32(vae->gpu, padded);
+        if (!vae->int8_activation || !vae->int8_scales) {
+            fail(error, error_size, "cannot allocate int8 video VAE activations: %s",
+                 h3_gpu_error(vae->gpu));
+            return 0;
+        }
+        if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                    "begin video VAE int8 FFN quantization")) return 0;
+        for (int index = 0; index < LAYERS; index++) {
+            vae_block *b = &vae->blocks[index];
+            b->w1_int8 = h3_gpu_tensor_new_i8(vae->gpu, (size_t)FFN * 2 * HIDDEN);
+            b->w1_scales = h3_gpu_tensor_new_f32(vae->gpu, FFN * 2);
+            b->w2_int8 = h3_gpu_tensor_new_i8(vae->gpu, (size_t)HIDDEN * FFN);
+            b->w2_scales = h3_gpu_tensor_new_f32(vae->gpu, HIDDEN);
+            if (!b->w1_int8 || !b->w1_scales || !b->w2_int8 || !b->w2_scales ||
+                !gpu_op(vae, h3_gpu_quantize_weight_int8(vae->gpu, b->w1_int8,
+                    b->w1_scales, b->w1_bf16, FFN * 2, HIDDEN), error,
+                    error_size, "video VAE w1 int8 quantization") ||
+                !gpu_op(vae, h3_gpu_quantize_weight_int8(vae->gpu, b->w2_int8,
+                    b->w2_scales, b->w2_bf16, HIDDEN, FFN), error,
+                    error_size, "video VAE w2 int8 quantization"))
+                return 0;
+        }
+        if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                    "submit video VAE int8 FFN quantization")) return 0;
+        for (int index = 0; index < LAYERS; index++) {
+            free_tensor(&vae->blocks[index].w1_bf16);
+            free_tensor(&vae->blocks[index].w2_bf16);
+        }
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: video VAE FFN in int8 (NAX)\n");
+    }
+    if (getenv("H3_PROFILE")) {
+        fprintf(stderr, "h3: video VAE weight prep (cast%s) %.3fs\n",
+                vae->int8_ffn ? " + int8 quantization" : "",
+                vae_now() - prep_start);
+    }
     /* The F32 originals are no longer read by run_block on this path. */
     for (int index = 0; index < LAYERS; index++) {
         free_tensor(&vae->blocks[index].w1);
@@ -574,7 +639,25 @@ static int run_block(vae_context *vae, int index, char *error,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
-    if (vae->bf16_mlp) {
+    if (vae->int8_ffn) {
+        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
+            rows * HIDDEN), "video VAE MLP input cast");
+        OP(h3_gpu_linear_int8_bf16(vae->gpu, vae->ff1_bf16,
+            vae->int8_activation, vae->int8_scales, vae->norm_bf16,
+            weight->w1_int8, weight->w1_scales, rows, HIDDEN, FFN * 2, 0),
+           "video VAE MLP input (int8)");
+        OP(h3_gpu_swiglu_bias_bf16(vae->gpu, vae->activated_bf16,
+            vae->ff1_bf16, weight->w1_b_bf16, rows, FFN),
+           "video VAE SwiGLU+bias (BF16)");
+        OP(h3_gpu_linear_int8_bf16(vae->gpu, vae->branch_bf16,
+            vae->int8_activation, vae->int8_scales, vae->activated_bf16,
+            weight->w2_int8, weight->w2_scales, rows, FFN, HIDDEN, 0),
+           "video VAE MLP output (int8)");
+        OP(h3_gpu_bias_add_bf16(vae->gpu, vae->branch_bf16, vae->branch_bf16,
+            weight->w2_b_bf16, rows, HIDDEN), "video VAE MLP output bias");
+        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->branch, vae->branch_bf16,
+            rows * HIDDEN), "video VAE MLP output cast");
+    } else if (vae->bf16_mlp) {
         OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
             rows * HIDDEN), "video VAE MLP input cast");
         OP(h3_gpu_linear_bf16(vae->gpu, vae->ff1_bf16, vae->norm_bf16,

@@ -442,7 +442,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
             @"h3_qkv_rope_bf16", @"h3_qkv_rope_bf16_coop",
             @"h3_qkv_rope_bf16_coop_uncached",
-            @"h3_swiglu_bf16",
+            @"h3_swiglu_bf16", @"h3_swiglu_bias_bf16", @"h3_bias_add_bf16",
             @"h3_layer_norm_bf16", @"h3_gelu_bf16",
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
@@ -4159,6 +4159,47 @@ int h3_gpu_swiglu_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(fused).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
             [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_swiglu_bias_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *fused,
+                            const h3_gpu_tensor *bias, uint32_t rows,
+                            uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, fused, (size_t)rows * width * 2,
+                              @"SwiGLU input") ||
+        !h3_gpu_require_bf16(gpu, bias, (size_t)width * 2,
+                              @"SwiGLU bias") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * width,
+                              @"SwiGLU output")) return 0;
+    swiglu_args args = {rows, width};
+    return h3_gpu_dispatch_2d(gpu, @"h3_swiglu_bias_bf16", width, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(fused).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_bias_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *bias, uint32_t rows,
+                         uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * width,
+                              @"bias add input") ||
+        !h3_gpu_require_bf16(gpu, bias, width, @"bias add bias") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * width,
+                              @"bias add output")) return 0;
+    swiglu_args args = {rows, width};
+    return h3_gpu_dispatch_2d(gpu, @"h3_bias_add_bf16", width, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
         });
 }
 

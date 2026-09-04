@@ -537,6 +537,16 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            uint32_t sequence, uint32_t query_heads,
                            uint32_t kv_heads, uint32_t head_dim,
                            float scale);
+/* SwiGLU over a bias-less fused projection: bias is [2*width] BF16. */
+int h3_gpu_swiglu_bias_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *fused,
+                            const h3_gpu_tensor *bias, uint32_t rows,
+                            uint32_t width);
+/* output[r,c] = input[r,c] + bias[c]; output may alias input. */
+int h3_gpu_bias_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *bias, uint32_t rows,
+                         uint32_t width);
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
