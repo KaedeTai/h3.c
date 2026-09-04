@@ -60,3 +60,22 @@ The first A/B of this path looked like a 2 s *loss*. It was run order: the
 BF16 reference went first on a cold machine and the identical DiT in the same
 logs drifted 23.8 -> 27.2 s across four runs. With 120 s cooldowns the same
 DiT measures 14.8 s in every run. Same lesson as the attention kernels above.
+
+## Energy mode matters more than any kernel above
+
+macOS Energy Mode (System Settings > Battery, or `pmset -g` `powermode`:
+0 = Automatic, 2 = High Power) was the unexplained variable behind the
+354/395/363/465 s spread of identical 15 s renders. Same binary, same
+config (turbo 4 steps, knobs, BF16 VAE, steel attention), 15 s @1152x640,
+machine cool, 120 s between runs:
+
+| | Automatic (cold15) | High Power |
+|---|---:|---:|
+| DiT denoise | 466 s | 309 s |
+| video VAE (BF16) | 122 s | 89 s |
+| wall | 615 s | 420 s |
+
+Adding `H3_VAE_INT8_FFN=1` in High Power: VAE 89 -> 70 s, wall 402.5 s.
+With post-processing on the same machine (RIFE 6 s + Real-ESRGAN 51 s +
+ffmpeg 6 s) the whole 15 s timelapse pipeline is ~465 s, level with the
+RTX 3090 reference workflow (300 + 181 s).
