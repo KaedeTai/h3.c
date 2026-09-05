@@ -137,3 +137,46 @@ this model to within 20%). A flash kernel that reached gemm rate would
 give ~1.9x at 5 s / ~2.3x at 15 s; sparse attention (STA-style) is the
 other route, but token-reduction/core-reuse already showed how badly
 Ref2VA tolerates training-free approximations.
+
+## Segmented FL2VA (5 x 3 s pinned to keyframes) - negative result, 2026-09-05
+
+Idea: attention is quadratic, so render a 15 s shot as five 3 s FL2VA
+segments, each pinned at both ends (`--first-frame` / `--last-frame`) to
+keyframes taken from one 3 s "fast-forward" render of the whole story, so
+the anchors are mutually consistent and nothing drifts. Tool:
+`tools/segmented_fl2va.py` (keyframe clip -> sharpest-frame picks -> one
+interactive h3 session for the segments -> concat dropping the seam frame).
+Run on the character-creation timelapse prompt at 1152x640, turbo 4 steps.
+
+Timing (High Power):
+
+| | direct 15 s | 5 x 3 s segmented |
+|---|---|---|
+| with knobs (core-reuse 4, token-reduction, int8 fc2) | 402 s | 529 s (65 clip + 463) |
+| no knobs (int8 fc2 only) | ~1339 s DiT (Ref2VA measurement) | 907 s (65 + 842) |
+
+Per segment without knobs: VAE encode 2 x 4.3 s, text encoder 7 s, DiT
+load 16 s, denoise 111 s (4 evals; first/last condition tokens make it
+more than the 93 s a bare 3 s T2VA would take), VAE decode 18 s. ~50 s of
+each ~170 s is fixed overhead, so the quadratic saving shrinks to 1.5-1.8x;
+with knobs the quadratic term is already gone and the overhead wins.
+
+The interactive session does not keep the DiT: the prepared-model cache key
+includes the conditioning key (prompt + frames), so every new prompt frees
+and reloads the transformer (16 s). Only `!again` benefits. Splitting text
+conditioning from the weight load would save ~16 s per shot for any
+many-shot workflow (KaedeStudio), not just this experiment.
+
+Quality is the real failure. The last-frame anchor only acts on the last
+two or three frames: PSNR against the target keyframe stays at ~22 dB (the
+same distance as the previous keyframe) through frame 68, dips to 14-20 dB
+at frame 70, then jumps to 30 dB at frame 72. The base model at 20 steps
+behaves the same (24.6 dB at frame 60, 29.4 at 72), so it is not the turbo
+LoRA. Visually every seam is a jump cut, often with UI panels glitching
+for a few frames after it. Inside each segment the model plays the whole
+"blank canvas to finished character" arc regardless of the sub-stage
+prompt - colour appears at 5 s, reverts to line art at 7 s, returns at
+9 s - because a 3 s clip of this prompt is a complete timelapse to it.
+The direct 15 s render is monotonic and clean. Keep single renders for
+anything with a narrative arc; segmenting only suits content where each
+piece is genuinely its own shot.
