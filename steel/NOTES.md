@@ -101,3 +101,39 @@ FL2VA turbo with all knobs: 402 s). The VAE took 265 s here against 70 s
 after the shorter FL2VA denoise with identical settings - the machine was
 22 minutes into sustained load, so High Power does not remove throttling,
 it only raises the ceiling.
+
+## Where the DiT time goes (M5 Max, 2026-09-05)
+
+Question: fal's H3 Max renders 5 s in ~3 s on GB200; we take 232 s of
+denoise for the same 5 s. Is there a software gap hiding in h3.c, or is it
+the hardware? Measured with `H3_PROFILE=1` and the `H3_SKIP_ATTN=1` probe,
+5 s @1152x640, turbo 4 steps, int8 fc2, steel attention, High Power:
+
+| | denoise (4 evals) | per eval |
+|---|---|---|
+| full | 232.4 s | 58.1 s |
+| attention skipped | 45.4 s | 11.4 s |
+| => attention alone | 187.0 s | 46.7 s (80%) |
+
+Token count: 124 frames -> latent_t 37, 72x40 latent, 2x2 patch -> 26,640
+video rows + 414 audio rows = 27,054. Per block: linears
+2*N*(5376*21504 + 7168*5376 + 3*5376*14336) = 2.09e13 FLOP, full
+attention 4*N^2*7168 = 2.10e13 FLOP; 50 blocks.
+
+* Linears: 1.04e15 FLOP / 11.4 s = ~92 TFLOPS. MLX's plain bf16 gemm on
+  this machine measures 57 TFLOPS, so the NAX/int8 linear path is already
+  above what MLX gets. Nothing to gain there.
+* Attention: 1.05e15 FLOP / 46.7 s = ~22 TFLOPS. MLX's own
+  `fast.scaled_dot_product_attention` at the same shape (1x56x27054x128,
+  bf16) measures 23.2 TFLOPS, so h3.c's steel integration is at parity;
+  the kernel itself runs at ~40% of gemm rate (softmax/rescale is not on
+  the matrix units).
+
+So the 45x gap to fal is the ~40x per-chip compute gap (B200 ~2.2 PFLOPS
+dense bf16 vs M5 Max ~57-90) plus multi-GPU. The only software lever
+above 1.5x is attention: it is 80% of the time at 5 s and, being
+quadratic, ~92% at 15 s (measured 1339 s DiT for 15 s Ref2VA agrees with
+this model to within 20%). A flash kernel that reached gemm rate would
+give ~1.9x at 5 s / ~2.3x at 15 s; sparse attention (STA-style) is the
+other route, but token-reduction/core-reuse already showed how badly
+Ref2VA tolerates training-free approximations.
