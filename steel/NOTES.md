@@ -180,3 +180,22 @@ prompt - colour appears at 5 s, reverts to line art at 7 s, returns at
 The direct 15 s render is monotonic and clean. Keep single renders for
 anything with a narrative arc; segmenting only suits content where each
 piece is genuinely its own shot.
+
+## Knobs off for good: clean 15 s vs the knobbed "final" (2026-09-05)
+
+Same timelapse prompt, 1152x640, turbo 4 steps, int8 fc2, int8 VAE, steel,
+seed 7, High Power. Clean = `--layers 45`, no core-reuse, no token-reduction.
+
+| | knobs (core-reuse 4 + token-reduction, layers 50) | clean (layers 45) |
+|---|---|---|
+| DiT denoise | ~309 s | 1490 s |
+| video VAE | 70 s | 116 s |
+| wall | 402 s | 1665 s |
+
+At frame 336 (14 s) the knobbed render has a smeared face (muddy eyes, no
+hair clip), a blob for the camera and a doubled hue bar in the colour
+panel - the token-reduction ghost; the clean render has a properly drawn
+face, a legible camera, clean hoodie strings and a crisp colour picker.
+The 4x is real but so is the damage. Defaults everywhere (KaedeStudio,
+kaedecode /video/h3) are now int8 fc2 + layers 45 only; core-reuse and
+token-reduction are preview-only opt-ins.
