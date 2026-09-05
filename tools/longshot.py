@@ -29,6 +29,7 @@ Script (JSON):
   "first_frame": null,                 # optional PNG pinned as keyframe 0
   "preview_seconds": 3,
   "seam_drop": 8,                      # frames cut after every pinned first frame (transient)
+  "seam_drop_before": 3,               # frames cut before every pinned last frame (transient)
   "audio":  {"keep_h3_audio": false, "music": null, "music_gain_db": -8, "fade_s": 1.5},
   "post":   {"rife_fps": 48, "upscale": 2}     # null to skip; uses ~/repos/*-ncnn-vulkan
 }
@@ -235,10 +236,18 @@ def stage_assemble(script, wd, a):
         e = st.get("segments", {}).get(str(s["index"])) or sys.exit(f"segment {s['index']} not rendered")
         files.append(e["file"])
     drop = script["seam_drop"]; n = len(files)
+    # The 2-3 frames BEFORE a pinned last frame are a transient too (a flash of the final
+    # state showed up at frame 71 of a construction-sketch segment), so every segment but
+    # the last also loses its tail. The anchor frame itself is not needed: the next segment
+    # resumes after its own transient.
+    drop_before = int(script.get("seam_drop_before", 3))
+    nframes = [st["segments"][str(sg["index"])]["frames"] for sg in segs]
     inputs, fc = [], []
     for i, f in enumerate(files):
         inputs += ["-i", f]; start = drop if i else 0
-        fc.append(f"[{i}:v]trim=start_frame={start},setpts=PTS-STARTPTS[v{i}];[{i}:a]atrim=start={start / FPS},asetpts=PTS-STARTPTS[a{i}]")
+        end = "" if i == n - 1 else f":end_frame={nframes[i] - drop_before}"
+        aend = "" if i == n - 1 else f":end={(nframes[i] - drop_before) / FPS}"
+        fc.append(f"[{i}:v]trim=start_frame={start}{end},setpts=PTS-STARTPTS[v{i}];[{i}:a]atrim=start={start / FPS}{aend},asetpts=PTS-STARTPTS[a{i}]")
     fc.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]")
     cut = os.path.join(wd, "assembled.mp4")
     run(["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]",
@@ -264,8 +273,8 @@ def stage_assemble(script, wd, a):
     from PIL import Image
     W, H = script["width"], script["height"]; s = 0.3
     seam_at = []; acc = 0
-    for i, sg in enumerate(segs):
-        fr = st["segments"][str(sg["index"])]["frames"]; acc += fr - (drop if i else 0)
+    for i, fr in enumerate(nframes):
+        acc += fr - (drop if i else 0) - (0 if i == n - 1 else drop_before)
         if i < n - 1: seam_at.append(acc)
     sheet = Image.new("RGB", (int(W * s) * 5, int(H * s) * max(1, len(seam_at))), "black")
     for r, c in enumerate(seam_at):

@@ -202,3 +202,34 @@ face, a legible camera, clean hoodie strings and a crisp colour picker.
 The 4x is real but so is the damage. Defaults everywhere (KaedeStudio,
 kaedecode /video/h3) are now int8 fc2 + layers 45 only; core-reuse and
 token-reduction are preview-only opt-ins.
+
+## longshot.py - the segmented pipeline as an SOP (2026-09-06)
+
+`tools/longshot.py SCRIPT WORKDIR preview|keyframes|segments|assemble|status`
+(skill: `~/.claude/skills/h3-longshot/SKILL.md`). Script = world + subject +
+timed beats; every stage stops for review; `segments --only N` re-rolls one.
+Timelapse run (ls3): preview 95 s, five segments 125-128 s each, assemble
+with music + RIFE 48 fps + ESRGAN x2 ~3 min; ~16 min wall to a 2304x1280
+deliverable, one segment re-rolled once.
+
+What the runs taught, beyond the two rules:
+
+* The fast-forward likes to OPEN on the final state (3 of 5 previews across
+  seeds/prompts). Saying the opening state first and last in the prompt
+  helps but is not reliable; re-rolling the seed is the fix (100 s each).
+  Rendering an "opening frame" from the world text alone does not work
+  (it painted the subject, then scribbles), and pinning a blank frame
+  borrowed from ANOTHER run broke seam 0: the clip drifted to its own UI
+  layout and segment 0 could not reach keyframe 1. So `first_frame` only
+  from the same kind of render, otherwise none.
+* Keyframe picks must reject transient popups: the sharpest frame in a
+  window is often the one with a dialog box. Candidates that stray from
+  the window's per-pixel median are dropped first.
+* Every segment needs visible, natural progress. "line art -> line art
+  tidied" made the model colour and un-colour the character on two seeds;
+  a partial-colour end state (hair only) wandered on one seed and held on
+  another. Prefer end states that are natural stopping points.
+* Transients on both sides of a pin: 2-5 frames after a first frame and
+  2-3 before a last frame (a flash of the finished character at frame 71
+  of the construction-sketch segment). `seam_drop` 8 / `seam_drop_before`
+  3 cut them.
