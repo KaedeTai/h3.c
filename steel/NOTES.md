@@ -233,3 +233,35 @@ What the runs taught, beyond the two rules:
   2-3 before a last frame (a flash of the finished character at frame 71
   of the construction-sketch segment). `seam_drop` 8 / `seam_drop_before`
   3 cut them.
+
+## Talking head (Ref2VA) cost/quality, measured on a real person (2026-09-06)
+
+Use case: one known person to camera, voice supplied by Breeze TTS. All our
+earlier Ref2VA numbers were 15 s of UI-heavy timelapse; this measures the
+shape that actually matters. 6 s, one reference photo (a face crop from real
+footage), Breeze-cloned voice track, int8 fc2, steel, no speed knobs.
+
+| | size | steps | wall | DiT | note |
+|---|---|---|---|---|---|
+| turbo | 1152x640 | 4 | 368 s | 270 s | identity holds, lipsync tracks |
+| turbo | 768x448 | 4 | 125 s | - | see below, unusable |
+| base | 1152x640 | 20 | 1669 s | 1404 s | clearly better face |
+
+* **FL2VA cannot be driven by an audio track.** `--ref-audio` is an ordered
+  reference, so it sets `reference_count`, which both selects Ref2VA and
+  trips "full references cannot be combined with frame anchors". Supplying a
+  voice to lipsync to is Ref2VA-only; FL2VA generates its own audio.
+* **One reference image is enough for identity.** No LoRA needed for "look
+  like this person" - and a LoRA would not change the compute anyway.
+* **Low-res + upscale is dead for a photoreal face**, unlike the anime-style
+  timelapse where it was merely lossy. 768x448 renders in a third of the
+  time, but realesr-animevideov3 turns hair into a black gel and erases skin
+  texture; realesrgan-x4plus leaves visible tile seams at -s 2. Faces are
+  where the viewer looks. Render the face at native size.
+* **base 20 vs turbo 4 is a real quality gap**, larger than on the animated
+  timelapse: turbo leaves the eyes mushy and the glasses frame soft, base
+  resolves eyes, catchlights, teeth and hair strands. 4.5x the wall time.
+  Turbo for drafts and internal cuts, base for anything published.
+* Cost per second of video is superlinear in take length (6 s = 61x
+  playback, 15 s = 109x), so cut a talking head into 5-8 s takes - which is
+  normal edit grammar anyway - rather than one long take.
