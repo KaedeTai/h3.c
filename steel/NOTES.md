@@ -138,48 +138,51 @@ give ~1.9x at 5 s / ~2.3x at 15 s; sparse attention (STA-style) is the
 other route, but token-reduction/core-reuse already showed how badly
 Ref2VA tolerates training-free approximations.
 
-## Segmented FL2VA (5 x 3 s pinned to keyframes) - negative result, 2026-09-05
+## Segmented FL2VA (5 x 3 s pinned to keyframes) - works, with two rules (2026-09-05)
 
 Idea: attention is quadratic, so render a 15 s shot as five 3 s FL2VA
 segments, each pinned at both ends (`--first-frame` / `--last-frame`) to
 keyframes taken from one 3 s "fast-forward" render of the whole story, so
 the anchors are mutually consistent and nothing drifts. Tool:
 `tools/segmented_fl2va.py` (keyframe clip -> sharpest-frame picks -> one
-interactive h3 session for the segments -> concat dropping the seam frame).
-Run on the character-creation timelapse prompt at 1152x640, turbo 4 steps.
+interactive h3 session for the segments -> concat). Character-creation
+timelapse prompt, 1152x640, turbo 4 steps, int8 fc2, layers 45, no knobs.
 
-Timing (High Power):
-
-| | direct 15 s | 5 x 3 s segmented |
+| | direct 15 s | 5 x 3 s |
 |---|---|---|
-| with knobs (core-reuse 4, token-reduction, int8 fc2) | 402 s | 529 s (65 clip + 463) |
-| no knobs (int8 fc2 only) | ~1339 s DiT (Ref2VA measurement) | 907 s (65 + 842) |
+| wall | 1665 s (DiT 1490 + VAE 116) | 769 s (clip 103 + segments 666) |
 
-Per segment without knobs: VAE encode 2 x 4.3 s, text encoder 7 s, DiT
-load 16 s, denoise 111 s (4 evals; first/last condition tokens make it
-more than the 93 s a bare 3 s T2VA would take), VAE decode 18 s. ~50 s of
-each ~170 s is fixed overhead, so the quadratic saving shrinks to 1.5-1.8x;
-with knobs the quadratic term is already gone and the overhead wins.
+Three rounds to get there; what each one taught:
 
-The interactive session does not keep the DiT: the prepared-model cache key
-includes the conditioning key (prompt + frames), so every new prompt frees
-and reloads the transformer (16 s). Only `!again` benefits. Splitting text
-conditioning from the weight load would save ~16 s per shot for any
-many-shot workflow (KaedeStudio), not just this experiment.
+1. With the speed knobs on (core-reuse 4 + token-reduction) it was slower
+   than direct (529 s vs 402 s) - once the quadratic term is gone the
+   ~50 s of fixed cost per segment (VAE encode of both anchors 2 x 4 s,
+   text encoder 7 s, DiT reload 16 s, VAE decode 18 s) wins - and the
+   seams were jump cuts. Knobs are dead anyway (see below).
+2. Clean keyframes fixed the anchors: three of four seams converged to the
+   target keyframe half a second early (PSNR 32-35 dB from frame 60 on)
+   instead of snapping on the last frame. But every segment still replayed
+   the whole "blank canvas to finished character" arc - the first frame
+   was honoured, then frames 2-5 collapsed to 13-17 dB and the canvas
+   went back to a sketch.
+3. That was the prompt. The shared preamble said the canvas "must start
+   completely blank and rebuild the character", and the model obeyed it in
+   every segment. Rewriting each segment prompt to state what is ALREADY
+   on the canvas and only this segment's change ("the canvas already holds
+   a clean black line-art ... the cursor fills flats ...") made all four
+   seams continuous (31-38 dB across) and the 15 s monotonic: blank ->
+   construction -> line art -> flats -> finished, no reverts.
 
-Quality is the real failure. The last-frame anchor only acts on the last
-two or three frames: PSNR against the target keyframe stays at ~22 dB (the
-same distance as the previous keyframe) through frame 68, dips to 14-20 dB
-at frame 70, then jumps to 30 dB at frame 72. The base model at 20 steps
-behaves the same (24.6 dB at frame 60, 29.4 at 72), so it is not the turbo
-LoRA. Visually every seam is a jump cut, often with UI panels glitching
-for a few frames after it. Inside each segment the model plays the whole
-"blank canvas to finished character" arc regardless of the sub-stage
-prompt - colour appears at 5 s, reverts to line art at 7 s, returns at
-9 s - because a 3 s clip of this prompt is a complete timelapse to it.
-The direct 15 s render is monotonic and clean. Keep single renders for
-anything with a narrative arc; segmenting only suits content where each
-piece is genuinely its own shot.
+Rules: (a) no speed knobs; (b) segment prompts describe the current state
+and the delta, never the whole arc. Residuals: the 2-5 frames after a
+pinned first frame are still a transient (floating UI panels), so
+`seam_drop` (default 8, 0.33 s) cuts them at every seam; the colour
+picker's hue and small panel details differ between segments, which reads
+as the user having picked another colour. The fast-forward clip doubles
+as a 103 s storyboard preview. The interactive h3 session does not keep
+the DiT across prompts (cache key includes the prompt) - 16 s per shot
+that a text-conditioning-only reset would save for every many-shot
+workflow.
 
 ## Knobs off for good: clean 15 s vs the knobbed "final" (2026-09-05)
 

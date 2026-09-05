@@ -141,11 +141,15 @@ def main():
     h3_session(spec, out_dir, lines, os.path.join(out_dir, "segments.log"))
     t2 = time.time(); print(f"{n} segments: {t2 - t1:.0f}s", flush=True)
 
-    # 4. concat, dropping the seam frame (segment i+1 starts on segment i's last frame)
+    # 4. concat. Segment i+1 starts on segment i's last frame, and the 2-5 frames after a
+    # pinned first frame are a transient (measured 13-17 dB against frame 0 before the
+    # motion settles at ~20 dB), so `seam_drop` frames are cut from every segment but the
+    # first. Default 8 = 0.33 s per seam (frame 6 was still 17 dB off on two of four seams).
+    seam_drop = int(spec.get("seam_drop", 8))
     inputs, fc = [], []
     for i, seg in enumerate(seg_files):
         inputs += ["-i", seg]
-        start = 1 if i else 0
+        start = seam_drop if i else 0
         fc.append(f"[{i}:v]trim=start_frame={start},setpts=PTS-STARTPTS[v{i}];"
                   f"[{i}:a]atrim=start={start / FPS},asetpts=PTS-STARTPTS[a{i}]")
     fc.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]")
