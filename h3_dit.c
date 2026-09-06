@@ -499,9 +499,51 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+/* Pre-quantized checkpoints (tools/quantize_h3_int8.py, and ComfyUI-style int8
+ * exports, which use the same per-row layout) carry `<name>` as I8 plus
+ * `<name>_scale` as F32. When both are present the weight is uploaded straight
+ * into the block's int8 slot and the load-time GPU quantize is skipped: half the
+ * bytes read from disk, and no quantize pass. Returns 1 when it took over, 0 to
+ * fall through to the BF16 path, -1 on a real error. */
+static int load_block_int8(h3_dit *dit, const char *prefix, const char *suffix,
+                           uint64_t rows, uint64_t columns,
+                           h3_gpu_tensor **quantized, h3_gpu_tensor **scales,
+                           char *error, size_t error_size) {
+    char name[192], scale_name[208];
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);
+    snprintf(scale_name, sizeof(scale_name), "%s_scale", name);
+    const h3_st_tensor *weight = h3_weight_find(dit->weights, name, NULL);
+    const h3_st_tensor *scale = h3_weight_find(dit->weights, scale_name, NULL);
+    if (!weight || weight->dtype != H3_DTYPE_I8 || !scale) return 0;
+    uint64_t shape[] = {rows, columns};
+    *quantized = h3_weight_load_i8(dit->weights, dit->gpu, name, 2, shape,
+                                   error, error_size);
+    if (!*quantized) return -1;
+    /* The scale is one float per output row; accept it stored as [rows] or
+     * [rows, 1] so a checkpoint written either way loads. */
+    uint64_t flat[] = {rows}, column[] = {rows, 1};
+    *scales = scale->ndim == 1 ?
+        h3_weight_load_f32(dit->weights, dit->gpu, scale_name, 1, flat,
+                           error, error_size) :
+        h3_weight_load_f32(dit->weights, dit->gpu, scale_name, 2, column,
+                           error, error_size);
+    if (!*scales) return -1;
+    return 1;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
+#define LOADQ(field, suffix, rows, columns) do {                               \
+    int taken = load_block_int8(dit, prefix, suffix, rows, columns,            \
+                                &block->field##_int8, &block->field##_scales,  \
+                                error, error_size);                            \
+    if (taken < 0) return 0;                                                   \
+    if (taken) break;                                                          \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                      \
+    block->field = bf2(dit, name, rows, columns, error, error_size);           \
+    if (!block->field) return 0;                                               \
+} while (0)
 #define LOAD1(field, suffix, width) do {                                       \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
     block->field = bf1(dit, name, width, error, error_size);                    \
@@ -514,14 +556,15 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
 } while (0)
     LOAD1(norm1, "norm1.weight", HIDDEN);
     LOAD1(norm2, "norm2.weight", HIDDEN);
-    LOAD2(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
+    LOADQ(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
-    LOAD2(out, "attn.out_proj.weight", HIDDEN, INNER);
-    LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
-    LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    LOADQ(out, "attn.out_proj.weight", HIDDEN, INNER);
+    LOADQ(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+    LOADQ(fc2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
+#undef LOADQ
     return 1;
 }
 
@@ -691,6 +734,8 @@ static void *read_stream_layer_thread(void *opaque) {
 
 static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
+    /* Already supplied by a pre-quantized checkpoint. */
+    if (block->fc1_int8) return 1;
     block->fc1_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)FFN * 2 * HIDDEN);
     block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
@@ -721,6 +766,8 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
 
 static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
+    /* Already supplied by a pre-quantized checkpoint. */
+    if (block->qkv_int8) return 1;
     block->qkv_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)INNER * 3 * HIDDEN);
     block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
@@ -741,6 +788,8 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
 
 static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
                                         char *error, size_t error_size) {
+    /* Already supplied by a pre-quantized checkpoint. */
+    if (block->out_int8) return 1;
     block->out_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)HIDDEN * INNER);
     block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);

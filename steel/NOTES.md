@@ -301,3 +301,51 @@ the cost was not worth an aesthetic bet in the wrong direction.
 
 Revisit if the anime/CG timelapse work ever needs better base quality - the
 compatibility groundwork above is done.
+
+## Pre-quantized int8 checkpoints (2026-09-06)
+
+h3.c read 66 GB of BF16 per transformer and then quantized the four big
+per-block projections to int8 on the GPU *on every load*
+(`quantize_block_mlp/qkv/attention_out`). `tools/quantize_h3_int8.py` does that
+step once, offline, and h3.c now loads the int8 directly.
+
+The converter is a port of `h3_quantize_bf16_int8_rows`, so the numbers are the
+ones the GPU would have produced:
+
+    max_abs = max |float32(w)| per row
+    scale   = max_abs > 0 ? max_abs/127 : 1/127
+    q       = clamp(rint(float32(w) * (127/max_abs)), -127, 127)
+
+Layout is `<name>` I8 [rows, cols] plus `<name>_scale` F32 [rows], matching the
+per-row convention ComfyUI-style int8 exports use, so the same loader reads those
+too (see the Singularity note above). adaln_proj is left BF16 - it feeds a BF16
+kernel - which is why the output is 47 GB rather than the 34 GB a fully
+quantized export reaches.
+
+| | BF16 checkpoint | int8 checkpoint |
+|---|---|---|
+| transformer on disk | 66.3 GB | 47.0 GB (71%) |
+| DiT load, 384x512 Ref2VA | 14.06 s | **6.93 s** |
+| DiT total (load + 4-step denoise) | 43.0 s | 37.0 s |
+| conversion time | - | 28 s per transformer |
+
+**Verifying equivalence needs a control.** The int8 render is not byte-identical
+to the BF16 one - but neither are two BF16 runs of the same command. Measured on
+frames 0/40/80/120, mean |diff| per pixel:
+
+    BF16 vs BF16 (same command, twice)   2.52  11.44  3.97  4.06
+    BF16 vs int8 checkpoint              3.02  10.79  4.13  5.21
+
+h3 is not bit-deterministic run to run (GPU reduction order), and the int8
+checkpoint sits inside that noise. Faces compared side by side are
+indistinguishable.
+
+Gotchas found while building it: the Ref2VA checkpoint is detected by the mere
+presence of `Ref2VA/transformer/model.safetensors.index.json`, and `config.json`
+must sit beside the shards - a converted directory that has neither loads as
+"ordered references require the Ref2VA checkpoint" or "missing required model
+file". The converter now writes both.
+
+`MiniMax-H3-turbo-int8/` is built with hardlinks to the shared text encoder and
+VAEs, so it costs 88 GB on top of the BF16 bundles rather than 161 GB. Deleting
+`MiniMax-H3-turbo/` once the int8 bundle is trusted frees 123 GB.
