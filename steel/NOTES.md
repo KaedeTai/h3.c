@@ -392,3 +392,40 @@ for a face: teeth, glasses rims and skin texture are all visibly better.
 
 `--ref-image-size` (match|max) does not rescue this - it fits the reference to
 the canvas, it does not letterbox it.
+
+## `--ref-audio` is a voice reference, not a soundtrack - the prompt is the script
+
+Every Ref2VA take from `A` through `I` produced audio nobody could understand,
+in the doctor's voice. Transcribing the muxed audio with whisper-large-v3 shows
+what it actually is:
+
+    F  "松哥哥的更魂傾向和成語無極計 / 真實的方便質感 /
+        畫面中沒有任何字幕和浮水印"
+    H  "頓光領導人強大前方小齊看賞 / 聖醫師錢吉德公 / 寫實記錄片豐功"
+
+Those are the *prompt* - "寫實紀錄片風格", "畫面中沒有任何字幕和浮水印" - read
+aloud. H3 is a joint audio-video model: it generates the speech, and the text
+prompt is what it says.
+
+The layout in `h3_dit.c` says it plainly. `H3_SEG_REF_AUDIO` accumulates into
+`audio_condition` and gets `schedule->audio_condition_rows` (a clean, fixed
+timestep); `H3_SEG_AUDIO` accumulates into `audio_target` and gets
+`schedule->audio_rows` (the denoising ladder). The reference clip conditions
+timbre; the soundtrack is denoised from noise alongside the video. The upstream
+ComfyUI graph agrees - `VAEDecodeAudio` on a generated latent, and no audio
+input node at all.
+
+So there is no lipsync-to-a-track mode to find, and Breeze TTS cannot drive
+these shots. Put the line in the prompt instead:
+
+| take | prompt | transcript of the result |
+|---|---|---|
+| J | 畫面描述 + 他說：「台詞」 | line, then mush from 3.0 s on |
+| K | 台詞 only | the line, clean |
+
+K is the recipe: **the dialogue is the prompt**. Scene description competes with
+it for the audio branch and corrupts the tail, so keep visual direction short or
+leave it out and carry framing with `--ref-image` and the canvas instead.
+
+Breeze's job here is not the soundtrack - it is generating the 5-10 s voice
+reference that `--ref-audio` clones.
