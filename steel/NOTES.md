@@ -265,3 +265,39 @@ footage), Breeze-cloned voice track, int8 fc2, steel, no speed knobs.
 * Cost per second of video is superlinear in take length (6 s = 61x
   playback, 15 s = 109x), so cut a talking head into 5-8 s takes - which is
   normal edit grammar anyway - rather than one long take.
+
+## Third-party Ref2VA fine-tune: WarmBloodAban/Minimax-h3_Singularity (2026-09-06)
+
+Evaluated as a possible fix for turbo Ref2VA's soft faces. Verified from 3 MB of
+safetensors headers plus 20 MB of showcase video - no full download needed.
+
+**Compatibility: yes, for the 34 GB file only.**
+* `..._ref2va_v1.3_int8.safetensors` (34 GB) is structurally identical to ours:
+  1035 tensors = our 535 plus a `weight_scale`/`comfy_quant` pair per quantized
+  weight; all 50 DiT blocks and 2 token_refiner blocks; every shape matches
+  (`qkv [21504,5376]`, `fc1 [28672,5376]`, `fc2 [5376,14336]`,
+  `adaln_proj [96768,2688]`). Names differ only by a `model.diffusion_model.` prefix.
+* `..._Pruned_v1.3_int8.safetensors` (21 GB) is NOT usable: it replaces
+  `adaln_proj.linear.weight` with `[96768, 8]`. That is a structural change, not
+  a quantization.
+* Its quantization is the scheme h3.c already uses: per-row symmetric int8,
+  `weight I8 [out,in]` + `weight_scale F32 [out,1]`, matching
+  `h3_quantize_bf16_int8_rows` (`scale = max|w|/127`, row-major char).
+  So it could be loaded straight into the existing `*_int8`/`*_scales` tensors,
+  skipping both the BF16 read and the load-time quantize.
+
+**Structural note learned on the way:** `adaln_proj` is 96768x2688 per block, so
+50 blocks = 13 G params = 26 of the transformer's 66 GB - **40% of the model**.
+That is what the "Pruned" build throws away.
+
+**Not adopted.** Every video in the repo's showcase is anime/CG action (2D anime
+fighters; a stylized 3D character with magic effects) - not one photoreal human.
+A fine-tune showcased entirely on anime action was very likely trained on it, and
+its advertised fixes read that way too ("distant face restoration" = anime faces
+in wide action shots, "de-oiled" = plastic CG skin). That pushes the aesthetic
+away from a photoreal talking head. Download speed here is ~1.4 MB/s (~7 h for
+34 GB; parallel connections do not help, the line saturates near 2-3 MB/s), so
+the cost was not worth an aesthetic bet in the wrong direction.
+
+Revisit if the anime/CG timelapse work ever needs better base quality - the
+compatibility groundwork above is done.
