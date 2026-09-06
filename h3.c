@@ -922,7 +922,20 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/text_encoder" : "FL2VA/text_encoder");
-    char *dit_path = h3_path(ctx->model_dir, ref2va ?
+    /* The two bundles share their tokenizer, text encoder and VAEs -- they are
+       hardlinks of the same files -- so the DiT weights are the only thing that
+       actually distinguishes FL2VA from Ref2VA. H3_DIT_VARIANT overrides just
+       that, to ask whether the FL2VA weights understand a REF_AUDIO segment
+       they were never trained on, or whether the segment vocabulary really is
+       split between the two checkpoints. */
+    const char *dit_variant = getenv("H3_DIT_VARIANT");
+    int dit_ref2va = ref2va;
+    if (dit_variant && !strcmp(dit_variant, "FL2VA")) dit_ref2va = 0;
+    else if (dit_variant && !strcmp(dit_variant, "Ref2VA")) dit_ref2va = 1;
+    if (dit_variant && dit_ref2va != ref2va)
+        fprintf(stderr, "h3: DiT weights forced to %s against a %s layout\n",
+                dit_ref2va ? "Ref2VA" : "FL2VA", ref2va ? "Ref2VA" : "FL2VA");
+    char *dit_path = h3_path(ctx->model_dir, dit_ref2va ?
         "Ref2VA/transformer" : "FL2VA/transformer");
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");

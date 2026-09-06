@@ -827,3 +827,47 @@ what the English scene description fixes and what no anchor can.
 Separately: `--first-frame` reads its image with `H3_IMAGE_FIT_STRETCH`
 (h3.c:1228), same as references (h3.c:1054). Frame anchors have the same aspect
 trap - crop them to the canvas ratio too.
+
+## The segment vocabulary is NOT split between the checkpoints
+
+Prediction: the FL2VA weights would ignore a `REF_AUDIO` segment, because
+FL2VA's training recipe is frame anchors and Ref2VA's is ordered references, so
+each checkpoint should only understand its own half of the vocabulary.
+
+Wrong. `H3_DIT_VARIANT=FL2VA|Ref2VA` (new) overrides only the DiT path - the two
+bundles hardlink the same tokenizer, text encoder and VAEs, so the transformer
+weights are the only real difference. Running the FL2VA weights against a
+Ref2VA layout (one image reference, one voice reference), 384x512, 3 s, seed 42:
+
+| take | weights | voice ref | median F0 | dF0 vs ref | timbre cos | speech |
+|---|---|---|---|---|---|---|
+| E | Ref2VA | yes | 192.7 Hz | 4.4 | 0.9860 | garbles from 「年紀」on |
+| D | **FL2VA** | yes | 177.7 Hz | **10.6** | **0.9928** | correct |
+| F | FL2VA | no | 124.2 Hz | 64.1 | 0.9504 | correct, invented voice |
+
+Reference is 188.3 Hz. F is what FL2VA invents with no voice reference - 64 Hz
+below, an audibly different man. D lands within 10.6 Hz with the best timbre
+match of the three, so **the FL2VA weights do read REF_AUDIO**. Its video is
+clean too: white coat, correct identity, a slightly wider framing than the
+control, and its transcript is the only one of the three that is completely
+correct - the Ref2VA control garbled its own second half on this seed.
+
+So the earlier explanation - "each checkpoint only learned half the conditioning
+grammar" - is too strong. Both read all four segment kinds; the fine-tunes
+differ in what they are *good* at, not in what they can parse. That is
+consistent with the anchor result: Ref2VA responded to a frame-aligned reference
+(frame 0 became the anchor image) but could not propagate it, which is a
+strength difference, not a vocabulary gap.
+
+**What this opens.** FL2VA is the checkpoint trained to carry a frame anchor
+through a whole clip. If it also honours a voice reference, then
+`--first-frame` + `--ref-audio` on FL2VA weights would give a locked composition
+*and* a cloned voice - deterministic framing instead of the seed lottery. Three
+things block it today, all in h3.c and all arithmetic:
+
+  1. `if (reference_count && (first_frame || last_frame))` rejects the mix;
+  2. keyframe time is hard-coded to `text_len`, so with references present the
+     anchor no longer lands on frame 0 (the fix is the `video_origin` sum
+     already written for H3_REF2VA_ANCHOR);
+  3. `h3_augment_conditions` and `visual_capacity` split their element
+     accounting on `ref2va` and would have to cover both at once.
