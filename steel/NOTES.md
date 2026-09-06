@@ -711,3 +711,47 @@ text encoder as conditioning without reaching the audio branch as script.
 So visual direction *is* available after all - it just has to be in English.
 That matters because wardrobe drift, not subtitles, is what blocks the doctor
 shots: the reference pins the face and nothing pins the coat.
+
+## English visual direction solves it: 6/6 on wardrobe, 0% subtitles
+
+Same six seeds, same two references, same knob. The only change is an English
+clause appended to the Mandarin line - and this one describes the shot rather
+than negating anything:
+
+    (elderly Taiwanese male doctor wearing a white lab coat over a blue shirt
+     and striped tie, seated in his clinic office, wooden bookshelf with framed
+     certificates behind him, locked-off camera, no zoom, no camera movement,
+     soft even indoor light, documentary realism)
+
+| | baseline | + English direction |
+|---|---|---|
+| white coat | 5/6, 69-99.5% | **6/6, 99.5-99.7%** |
+| burned-in subtitle (mean) | 0.089% | **0.000%** |
+| speech correct | ~3/5 | **5/6** |
+
+Seed 7 - which failed under all five earlier configurations, falling into a
+street-interview set with a handheld press microphone every time - comes back as
+a doctor in a white coat in his clinic, with a correct soundtrack. Seed 1, which
+garbled its last line on the baseline, is now correct too.
+
+Note what did *not* work: the earlier English clause that said "no subtitles, no
+captions, no on-screen text" left the subtitle rate unchanged (0.089% ->
+0.116%). Negation does nothing; description does everything. The burned-in
+subtitle appears to belong to the model's prior for a bare dialogue line - the
+short-form social clip - and a cinematographic description moves the shot into a
+documentary prior where it is not the norm.
+
+So the rule is: **the spoken language carries the script, another language
+carries the direction, and the direction is positive.** No cropping is needed
+any more; the deliverable is the full 480x640 frame.
+
+Current recipe for a talking head, end to end, 3:25 a take:
+
+    ./h3 -d ./MiniMax-H3 -p "<the line><English scene description>" \
+      --ref-image face_3to4.png --ref-image wide_3to4.png --ref-audio voice.wav \
+      --width 480 --height 640 --frames 158 --steps 20 \
+      --use-int8-row-fc2 --core-reuse 4 -o out.mp4
+    tools/clean_h3_audio.sh out.mp4 final.mp4
+
+References must be cropped to the canvas aspect, not resized to it. Layers stay
+at 50 and token reduction stays off, both because they damage the audio branch.
