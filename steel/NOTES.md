@@ -471,3 +471,71 @@ before, so nothing of the speech was lost.
 Order of operations that matters: more steps shrinks the side channel (turbo
 -17.3 -> base 20 -23.8 -> base 30 -25.3), but mono collapse removes it entirely,
 so the cheap fix dominates. Do not buy steps for audio; buy them for video.
+
+## A speed knob is safe for the soundtrack only if it touches video rows alone
+
+Listening test on the four 480x640 base-20 takes, ranked by how badly the speech
+doubles over itself:
+
+| take | knob | speech | picture |
+|---|---|---|---|
+| L | none | clean | reference |
+| P | `--token-reduction` | **clean** | horizontally soft |
+| O | `--core-reuse 4` | doubles for the first ~0.6 s | ok |
+| N | `--layers 45` | doubles for ~2.9 s | ok |
+| R | (no knob) | destroyed | - |
+
+The spectrograms show exactly that: L and P have a dark gap at 2.93-3.52 s and
+clean harmonic stacks; O fills the first 0.6 s where L is silent; N fills most of
+0-2.9 s with a second harmonic texture and largely closes the gap.
+
+`token_pool_sources()` explains it in four lines:
+
+    if (reduced_row < dit->video_target_start) {
+        *first = reduced_row; *second = reduced_row; return;
+    }
+
+Every row before `video_target_start` - text, the ordered references, and the
+whole audio segment - is returned unpooled. Token reduction is a video-only
+transform, so the audio branch never sees it. `--layers` and `--core-reuse`
+skip or reuse *whole DiT blocks*, and the audio rows sit in the same packed
+sequence, so they take the damage too. More blocks skipped = longer doubling,
+which is why N is worse than O.
+
+The cost of the one safe knob is anisotropic. The pairing runs along
+`spatial_width`:
+
+    uint32_t spatial_width = (uint32_t)dit->latent_w / 2;
+    ... (local % reduced_width) * 2;
+
+so horizontal resolution is halved and vertical is untouched. Measured as
+high-frequency energy along x minus along y on frames 40/100: L +1.48 dB,
+P -2.04 dB. That 3.5 dB is the "slightly squashed" look - it is real, and it is
+horizontal-only by construction.
+
+Practical rule for a talking head: **no knobs**. `--token-reduction` is the only
+one that keeps the speech, and it costs horizontal detail on the one thing the
+shot is about. Save it for previews.
+
+## There is no negative prompt: the whole string is the script
+
+Take R appended one short clause to the line - 「畫面中沒有任何字幕或浮水印。」
+- and two things happened: the burned-in subtitle rendered those exact words,
+and the speech was destroyed outright. Take Q appended
+「固定鏡頭臉部特寫...」 and the model simply spoke it as another sentence.
+
+So the prompt is not "description plus instructions". It is the script, and
+anything in it is a candidate for being spoken and for being drawn as a subtitle.
+Wardrobe and framing have to come from `--ref-image`, not from words.
+
+Subtitles appear regardless and cannot be prompted away. Detected by the
+saturated glyph yellow in the lower 45% of the frame:
+
+| take | subtitle rows (of 640) |
+|---|---|
+| Q | 507-534 |
+| R | 509-565 |
+| L | 536-615 |
+
+Cropping the bottom 128 px clears every case seen so far, at the cost of turning
+a 480x640 render into 480x512.
