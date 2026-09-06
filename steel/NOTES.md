@@ -677,3 +677,37 @@ handles white-on-dark-outline.
 
 The finished shot: seed 42, mono downmix, bottom 144 px cropped to clear the
 subtitle, 480x496.
+
+## English is not spoken - which is the lever, not the subtitle suppression
+
+Tested "no subtitles, no captions, no on-screen text, no watermark, clean frame"
+appended to the Mandarin line, across the same six seeds as the baseline.
+
+**It does not suppress subtitles.** Paired, by the glyph detector (bright core
+with a dark rim, restricted to rows that span at least 18% of the width, which
+is what separates a subtitle line from a collar edge):
+
+| seed | baseline | +English |
+|---|---|---|
+| 1 | 0.000% | 0.000% |
+| 23 | 0.000% | 0.000% |
+| 11 | 0.016% | 0.026% |
+| 3 | 0.092% | 0.192% |
+| 42 | 0.168% | 0.161% |
+| 7 | 0.259% | 0.317% |
+| **mean** | **0.089%** | **0.116%** |
+
+Slightly worse, inside the noise, and seed 23 gained a subtitle it did not have.
+
+**But the English was never spoken.** whisper on five of the six takes finds the
+Mandarin line and no English at all - and seed 3, which garbled 「出了錯的狀況」
+on the baseline, came out correct with the clause appended.
+
+That reverses the earlier conclusion. "The prompt is the script" was measured
+with Chinese instructions, which the model duly read aloud (take Q) or choked on
+(take R). Instructions in a language other than the spoken one pass through the
+text encoder as conditioning without reaching the audio branch as script.
+
+So visual direction *is* available after all - it just has to be in English.
+That matters because wardrobe drift, not subtitles, is what blocks the doctor
+shots: the reference pins the face and nothing pins the coat.
