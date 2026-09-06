@@ -429,3 +429,45 @@ leave it out and carry framing with `--ref-image` and the canvas instead.
 
 Breeze's job here is not the soundtrack - it is generating the 5-10 s voice
 reference that `--ref-audio` clones.
+
+## The audio artifact is the side channel, and mono analysis cannot see it
+
+Reported as "obvious noise" on the turbo takes. Three measurement attempts found
+nothing, because all three averaged the stereo track to mono first:
+
+- gap-frame spectra: the long 2.9-3.5 s pause is dark in every clip
+- CPP (harmonic definition): 0.95-1.05 for every take, reference included
+- 5-11 kHz energy by loudness decile: generated clips mostly *quieter* than the
+  reference
+
+The first pass also reported a false result: the per-group spectra were
+normalised to each group's own peak, so a highpass that removed low-frequency
+rumble made the high band look worse. Any band comparison has to be absolute
+dBFS with the clips gain-matched.
+
+What is actually wrong: `h3_audio_latent` is `[32,2,T]` - genuinely stereo - and
+the DiT denoises both channels from independent noise. They converge on the same
+waveform only if given enough steps. Side channel relative to mid:
+
+| take | steps | side/mid |
+|---|---|---|
+| reference wang_line.wav | - | true mono, no side at all |
+| I 384x512 | base 20 | -29.2 dB |
+| M 480x640 | base 30 | -25.3 dB |
+| L 480x640 | base 20 | -23.8 dB |
+| J 480x640 | turbo 4 | -18.7 dB |
+| K 384x512 | turbo 4 | **-17.3 dB** |
+
+The side content sits at 1-8 kHz (K: -34.8 / -38.1 dB), right on top of the
+voice, which is why it reads as a wide phasey hiss around the speech rather than
+as hiss in the silences.
+
+The fix is `tools/clean_h3_audio.sh`: collapse to mid. The voice reference is
+mono, so there is no stereo information to protect, and because the in-phase
+noise in the two channels is independent too, the downmix takes another 3 dB off
+what remains. whisper-large-v3 transcribes the cleaned L and M takes exactly as
+before, so nothing of the speech was lost.
+
+Order of operations that matters: more steps shrinks the side channel (turbo
+-17.3 -> base 20 -23.8 -> base 30 -25.3), but mono collapse removes it entirely,
+so the cheap fix dominates. Do not buy steps for audio; buy them for video.
