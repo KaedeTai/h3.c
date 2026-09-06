@@ -110,6 +110,13 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
  * to it, are driven by it. NULL disables. Pointer must outlive the denoise. */
 void h3_dit_set_audio_anchor(h3_dit *dit, const float *anchor);
 
+/* Start the Euler integration at `step` instead of 0, for a latent that was
+ * initialised at that step's sigma rather than from pure noise (SDEdit). The
+ * caller is responsible for the initial blend; this only skips the sweep the
+ * blend replaces. Returns the sigma the latent must be prepared at. */
+float h3_dit_sigma_at(const h3_dit *dit, int step);
+void h3_dit_set_start_step(h3_dit *dit, int step);
+
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,

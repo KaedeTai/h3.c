@@ -899,8 +899,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     /* H3_AUDIO_ANCHOR=1: keep the encoded reference audio as a [32,2,T]
        latent and hand it to the sampler as a known soundtrack. */
     float *audio_anchor = NULL;
+    /* 1 = the soundtrack rides its true noised trajectory; "clean" = the video
+       sees the finished soundtrack from the first step. */
     int want_audio_anchor = getenv("H3_AUDIO_ANCHOR") &&
         *getenv("H3_AUDIO_ANCHOR") && strcmp(getenv("H3_AUDIO_ANCHOR"), "0");
+    /* H3_VIDEO_INIT_SIGMA=<s>: start the video from the reference still noised
+       to sigma s instead of from pure noise, and skip the steps above s
+       (SDEdit). The early steps decide global structure, which for a locked-off
+       shot the still already is. */
+    float *still_latent = NULL;           /* [24, 1, lh, lw] of reference 1 */
+    int still_lh = 0, still_lw = 0;
+    float video_init_sigma = 0.0f;
+    {
+        const char *v = getenv("H3_VIDEO_INIT_SIGMA");
+        if (v && *v) video_init_sigma = strtof(v, NULL);
+        if (video_init_sigma <= 0.0f || video_init_sigma >= 1.0f)
+            video_init_sigma = 0.0f;
+    }
     h3_text_embedding text;
     memset(&text, 0, sizeof(text));
     h3_layout layout;
@@ -1366,6 +1381,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 h3_set_error(ctx, "cannot patchify visual condition latent");
                 goto cleanup;
             }
+            if (video_init_sigma > 0.0f && image == 0 && !still_latent &&
+                image_latent_t == 1) {
+                size_t count = (size_t)24 * (size_t)image_latent_h *
+                               (size_t)image_latent_w;
+                still_latent = malloc(count * sizeof(*still_latent));
+                if (!still_latent) {
+                    h3_video_latent_free(&latent);
+                    h3_set_error(ctx, "out of memory keeping the still latent");
+                    goto cleanup;
+                }
+                memcpy(still_latent, latent.values, count * sizeof(*still_latent));
+                still_lh = image_latent_h; still_lw = image_latent_w;
+            }
             h3_video_latent_free(&latent);
             condition_offset += row_elements;
             if (progress.cancelled) goto cleanup;
@@ -1621,6 +1649,34 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_dit_set_audio_anchor(dit, audio_anchor);
+    if (video_init_sigma > 0.0f) {
+        if (!still_latent || still_lh != latent_h || still_lw != latent_w) {
+            h3_set_error(ctx, "H3_VIDEO_INIT_SIGMA needs a single-image "
+                              "reference at the render canvas");
+            goto cleanup;
+        }
+        /* Snap to the schedule: the latent has to be prepared at a sigma the
+           sampler will actually resume from. */
+        int start = 0;
+        while (start + 1 < params->steps &&
+               h3_dit_sigma_at(dit, start) > video_init_sigma) start++;
+        float s0 = h3_dit_sigma_at(dit, start);
+        size_t plane = (size_t)latent_h * (size_t)latent_w;
+        for (int c = 0; c < 24; c++)
+            for (int t = 0; t < temporal.video_t; t++)
+                for (size_t i = 0; i < plane; i++) {
+                    size_t dst = ((size_t)c * (size_t)temporal.video_t +
+                                  (size_t)t) * plane + i;
+                    /* the still is one latent frame, held across the clip */
+                    float x0 = still_latent[(size_t)c * plane + i];
+                    video[dst] = (1.0f - s0) * x0 + s0 * video[dst];
+                }
+        /* The audio latent stays pure noise here; the sampler prepares its
+           own blend at the start sigma, since it owns the anchor. */
+        h3_dit_set_start_step(dit, start);
+        fprintf(stderr, "h3: video seeded from the still at sigma %.3f, "
+                "skipping %d of %d steps\n", (double)s0, start, params->steps);
+    }
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
@@ -1764,6 +1820,7 @@ cleanup:
     free(presentation_timestamps);
     free(layout_references);
     free(condition_video_rows);
+    free(still_latent);
     free(audio_anchor);
     free(condition_audio_rows);
     h3_text_embedding_free(&text);

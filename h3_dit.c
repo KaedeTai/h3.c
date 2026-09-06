@@ -108,6 +108,13 @@ struct h3_dit {
     int core_reuse_audio_pass;
     /* See h3_dit_set_audio_anchor. */
     const float *audio_anchor;
+    /* 1 = give the video the finished soundtrack at every step instead of the
+       trajectory. Off-distribution for the DiT, which only ever saw audio rows
+       noised to the step's sigma, but it hands the picture more information
+       earlier. H3_AUDIO_ANCHOR=clean. */
+    int audio_anchor_clean;
+    /* See h3_dit_set_start_step. */
+    int start_step;
     unsigned core_forward_count;
     int core_residual_ready;
     unsigned active_block_count;
@@ -2933,7 +2940,19 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
 }
 
 void h3_dit_set_audio_anchor(h3_dit *dit, const float *anchor) {
-    if (dit) dit->audio_anchor = anchor;
+    if (!dit) return;
+    dit->audio_anchor = anchor;
+    const char *mode = getenv("H3_AUDIO_ANCHOR");
+    dit->audio_anchor_clean = mode && !strcmp(mode, "clean");
+}
+
+float h3_dit_sigma_at(const h3_dit *dit, int step) {
+    if (!dit || step < 0 || step > dit->sigmas.steps) return 0.0f;
+    return dit->sigmas.video[step];
+}
+
+void h3_dit_set_start_step(h3_dit *dit, int step) {
+    if (dit && step >= 0 && step < dit->sigmas.steps) dit->start_step = step;
 }
 
 int h3_dit_denoise_euler_preview(
@@ -3003,7 +3022,15 @@ int h3_dit_denoise_euler_preview(
             free(last_audio); free(previous_audio);
             return 0;
         }
+        /* The caller hands in pure noise; keep it as the fixed epsilon and
+           immediately place the audio on its known trajectory at the sigma the
+           loop starts from, so a skipped prefix needs nothing from the caller. */
         memcpy(anchor_noise, audio_latent, audio_count * sizeof(*anchor_noise));
+        float s0 = dit->audio_anchor_clean ? 0.0f
+                                          : dit->sigmas.audio[dit->start_step];
+        for (size_t i = 0; i < audio_count; i++)
+            audio_latent[i] = (1.0f - s0) * dit->audio_anchor[i] +
+                              s0 * anchor_noise[i];
         if (getenv("H3_PROFILE"))
             fprintf(stderr, "h3: audio anchor active, %zu latent elements\n",
                     audio_count);
@@ -3011,7 +3038,7 @@ int h3_dit_denoise_euler_preview(
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
-    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
+    for (int step = dit->start_step; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
         int evaluate = selected[step];
         if (evaluate) {
@@ -3050,17 +3077,21 @@ int h3_dit_denoise_euler_preview(
             ok = h3_euler_velocity_step(
                      video_latent, video_velocity, video_count,
                      dit->sigmas.video[step], dit->sigmas.video[step + 1]) &&
-                 h3_euler_velocity_step(
+                 /* An anchored soundtrack is overwritten immediately below, so
+                    integrating it is dead work. */
+                 (dit->audio_anchor ? 1 : h3_euler_velocity_step(
                      audio_latent, audio_velocity, audio_count,
-                     dit->sigmas.audio[step], dit->sigmas.audio[step + 1]);
+                     dit->sigmas.audio[step], dit->sigmas.audio[step + 1]));
             if (!ok) fail(error, error_size,
                           "Euler solver rejected step %d", step);
             if (ok && dit->audio_anchor) {
                 /* Flow matching here is x_s = (1 - s) x0 + s eps with the
                    velocity v = x0 - eps, so the known latent at the next sigma
                    is exactly this. At the last step s = 0 and the audio rows
-                   ARE the reference. */
-                float s_next = dit->sigmas.audio[step + 1];
+                   ARE the reference. In clean mode they are the reference the
+                   whole way. */
+                float s_next = dit->audio_anchor_clean
+                    ? 0.0f : dit->sigmas.audio[step + 1];
                 for (size_t i = 0; i < audio_count; i++)
                     audio_latent[i] = (1.0f - s_next) * dit->audio_anchor[i] +
                                       s_next * anchor_noise[i];
