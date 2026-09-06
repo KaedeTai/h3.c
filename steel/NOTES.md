@@ -631,3 +631,49 @@ is everything the reference crop does not cover.
 Practical consequence: a talking-head shot needs more than one roll. That is
 affordable now - core-reuse 4 with the audio pass is 2:55 against 6:49 - so the
 speedup buys takes rather than buying a single faster take.
+
+## Two ordered references fix the wardrobe; the rest is a seed lottery per axis
+
+h3 takes up to 12 ordered references, and wardrobe cannot be written into the
+prompt without being spoken - so give it a second picture instead. Reference 1
+is the tight 3:4 face crop (identity), reference 2 is the widest 3:4 box the
+poster allows, 720x960 scaled to 480x640, which actually contains the white
+coat, the tie and the bookshelf.
+
+Scored automatically: sample the two shoulder blocks either side of the tie in
+the lower third (rows 72-92%, columns 6-30% and 70-94%) and count bright,
+desaturated pixels. The separation is unambiguous - no take lands between 2.4%
+and 54%.
+
+| config | seeds passing |
+|---|---|
+| one reference + `--core-reuse 4` | 0 / 2 (2.4%, 0.4%) |
+| one reference, no knobs | 1 / 2 (66.6%, 0.0%) |
+| **two references + `--core-reuse 4`** | **5 / 6** |
+
+Two-reference scores: seed 1 99.5%, seed 3 98.3%, seed 11 90.0%, seed 42 88.6%,
+seed 23 69.0%, seed 7 2.1%. Seed 7 fails under all five configurations tried -
+it falls into a street-interview mode with a handheld press microphone that
+nothing pulls it out of.
+
+The catch is that the three failure modes are independent, so no single take was
+clean on all of them:
+
+| seed | coat | speech | other |
+|---|---|---|---|
+| 1 | 99.5% | third line garbled | nothing - cleanest picture of the session |
+| 3 | 98.3% | 「出了錯的狀況」 | white subtitle |
+| 23 | 69.0% | correct | press microphone in shot |
+| 42 | 88.6% | correct | yellow subtitle, rows 507-534 |
+| 7 | 2.1% | - | grey suit, mic, news set |
+
+So each axis is individually likely and the conjunction is not. At 3:22 a take,
+rolling five or six and picking is ~20 minutes - still cheaper than one 6:49
+unknobbed take, which is subject to exactly the same lottery.
+
+Note the subtitle detector only catches the saturated yellow style; seeds 3 and
+11 burn in white subtitles that it scores as clean. Check by eye until it also
+handles white-on-dark-outline.
+
+The finished shot: seed 42, mono downmix, bottom 144 px cropped to clear the
+subtitle, 480x496.
