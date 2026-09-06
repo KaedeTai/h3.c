@@ -755,3 +755,27 @@ Current recipe for a talking head, end to end, 3:25 a take:
 
 References must be cropped to the canvas aspect, not resized to it. Layers stay
 at 50 and token reduction stays off, both because they damage the audio branch.
+
+## tools/talking_head.py
+
+The recipe above as a tool, because every rule in it was paid for in a wrong
+take and none of them is guessable from the CLI help.
+
+    talking_head.py WORK init  --poster P.png --voice V.wav --line "..." [--direction "..."]
+    talking_head.py WORK crops --face x,y,w,h --wide x,y,w,h
+    talking_head.py WORK run   [--seeds 1,3,7,11,23,42]
+    talking_head.py WORK score
+    talking_head.py WORK pick  [--out final.mp4]
+
+`crops` refuses a box whose aspect does not already match the canvas rather than
+resizing it to fit, which is the mistake that narrowed the doctor's face 11% for
+a whole day of takes. `run` never passes `--layers` or `--token-reduction` and
+does pass `--core-reuse 4`. `score` reports the three independent failure modes
+separately, and `pick` ranks on wardrobe first, then line accuracy, then
+subtitle, and downmixes the winner to mono.
+
+Line accuracy is LCS against the intended line, not character overlap: the first
+version scored a take whose speech was pure noise at 100%, because Mandarin
+reuses few enough characters that a bag-of-characters match fills up on
+coincidence. Verified on a known-garbled take, which scores 13.3% under LCS and
+100% under the bag.
