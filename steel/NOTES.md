@@ -359,3 +359,36 @@ SSD; the external copy is exFAT, so the hardlinks materialise and it occupies
 (which prefers int8 -> turbo -> base, whichever exists first).
 `tools/patch_h3_turbo.py` still emits BF16 by design - its output has to be
 re-quantized before anything will use it.
+
+## The reference crop must be cropped to the canvas aspect, never resized to it
+
+Every head-shot take before 2026-09-06 15:40 (`E`, `F`, `G` in
+`~/models/_wang_test`) used `wang_head_ref.png`, which was the poster region
+`(122,187,497x589)` *resized* to 384x512. 497/589 = 0.844, 384/512 = 0.750, so
+the reference face was squeezed 11% horizontally - and Ref2VA reproduced the
+squeeze faithfully for the whole clip. It reads as "he looks thinner than the
+photo", which is easy to blame on the model.
+
+The fix is to make the crop box itself match the canvas aspect and then scale
+uniformly. `wang_face34_native.png` is `(115,180,444x592)` - 444/592 = 0.750
+exactly - and 444/384 = 592/512 = 1.15625, 444/480 = 592/640 = 0.925, so both
+canvases are pure downscales of the same box. Assert it in code rather than
+eyeballing it:
+
+    assert crop.size[0] / w == crop.size[1] / h
+
+Same 20-step base run, same audio, only the reference changed:
+
+| take | canvas | reference | denoise |
+|---|---|---|---|
+| F | 384x512 | squeezed | 185.5 s |
+| H | 384x512 | cropped 3:4 | 184.8 s |
+| I | 480x640 | cropped 3:4 | 356.6 s |
+
+So the fix is free, and the aspect error was never a speed/quality tradeoff -
+just a bad crop. 480x640 is 300 tokens against 384x512's 192 (1.56x), and costs
+1.93x the denoise time, close to the N^2 attention prediction. It is worth it
+for a face: teeth, glasses rims and skin texture are all visibly better.
+
+`--ref-image-size` (match|max) does not rescue this - it fits the reference to
+the canvas, it does not letterbox it.
