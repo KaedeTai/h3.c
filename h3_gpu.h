@@ -549,6 +549,9 @@ int h3_gpu_bias_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *bias, uint32_t rows,
                          uint32_t width);
+int h3_gpu_add_bf16_range(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                          uint32_t first_element, uint32_t elements);
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);

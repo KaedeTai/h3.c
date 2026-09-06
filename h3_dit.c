@@ -101,6 +101,11 @@ struct h3_dit {
     float spatial_rope_scale;
     int bf16_final;
     unsigned core_reuse_interval;
+    /* On a reuse step the core blocks are re-run over the sequence prefix only
+       (text + ordered references + audio), because the target video segment is
+       the contiguous tail. Keeps the soundtrack denoising while the video rows
+       take the cached residual. */
+    int core_reuse_audio_pass;
     unsigned core_forward_count;
     int core_residual_ready;
     unsigned active_block_count;
@@ -1938,8 +1943,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         dit->reduced_rope_cos : dit->rope_cos;
     h3_gpu_tensor *rope_sin = dit->token_reduction_active ?
         dit->reduced_rope_sin : dit->rope_sin;
-    uint32_t rows = dit->token_reduction_active ?
-        dit->reduced_sequence : dit->sequence;
+    uint32_t rows = dit->core_reuse_audio_pass ? dit->video_target_start :
+        (dit->token_reduction_active ? dit->reduced_sequence : dit->sequence);
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
@@ -2221,7 +2226,24 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (evaluate_core && dit->core_reuse_interval > 1)
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
                             hidden_elements), "save DiT core input");
-    if (evaluate_core) {
+    /* Core reuse freezes whatever it is applied to. The audio target is only
+       ~2% of the sequence (263 rows against 12000 for a 6.5 s 480x640 shot), so
+       freezing it saves nothing and costs the soundtrack: the speech doubles
+       over itself for as long as the residual is stale. Instead give the video
+       tail the cached residual and re-run the blocks over the prefix, which is
+       exactly text + ordered references + audio because the target video ends
+       the packed layout. */
+    int audio_pass = !evaluate_core && dit->video_target_start &&
+        !getenv("H3_CORE_REUSE_FREEZE_AUDIO");
+    if (!evaluate_core) {
+        uint32_t tail = audio_pass ? dit->video_target_start * HIDDEN : 0;
+        OP(h3_gpu_add_bf16_range(dit->gpu, dit->hidden, dit->hidden,
+                                 dit->core_residual, tail,
+                                 hidden_elements - tail),
+           "reuse DiT core residual");
+    }
+    dit->core_reuse_audio_pass = audio_pass;
+    if (evaluate_core || audio_pass) {
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
         if (dit->ssd_streaming) command_blocks = 0;
@@ -2352,17 +2374,17 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         if (use_token_reduction &&
             token_reduction_end == H3_DIT_BLOCKS &&
             !leave_token_reduction(dit, error, error_size)) return 0;
-        if (dit->core_reuse_interval > 1) {
+        /* Only a full pass may refresh the cache: after an audio pass the video
+           tail of `hidden` has not been through the blocks this step, so the
+           difference against core_input is not a core residual at all. */
+        if (evaluate_core && dit->core_reuse_interval > 1) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
                                dit->core_input, hidden_elements),
                "cache DiT core residual");
             dit->core_residual_ready = 1;
         }
-    } else {
-        OP(h3_gpu_add_bf16(dit->gpu, dit->hidden, dit->hidden,
-                           dit->core_residual, hidden_elements),
-           "reuse DiT core residual");
     }
+    dit->core_reuse_audio_pass = 0;
     dit->core_forward_count++;
     const h3_gpu_tensor *final = h3_dit_schedule_final(dit->schedule);
     int fused_final_head = dit->bf16_final &&

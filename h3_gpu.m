@@ -4490,6 +4490,27 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return 1;
 }
 
+/* Add over a contiguous element range. The DiT's target video segment is the
+   tail of the packed sequence, so applying the cached core residual to the video
+   rows alone is a buffer offset, not a repack. */
+int h3_gpu_add_bf16_range(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *left, const h3_gpu_tensor *right,
+                          uint32_t first_element, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    size_t need = (size_t)first_element + elements;
+    if (!h3_gpu_require_bf16(gpu, left, need, @"add left") ||
+        !h3_gpu_require_bf16(gpu, right, need, @"add right") ||
+        !h3_gpu_require_bf16(gpu, output, need, @"add output")) return 0;
+    NSUInteger byte_offset = (NSUInteger)first_element * 2;
+    return h3_gpu_dispatch_1d(gpu, @"h3_add_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(left).buffer offset:byte_offset atIndex:0];
+            [encoder setBuffer:TENSOR(right).buffer offset:byte_offset atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:byte_offset atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
 int h3_gpu_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements) {

@@ -539,3 +539,47 @@ saturated glyph yellow in the lower 45% of the frame:
 
 Cropping the bottom 128 px clears every case seen so far, at the cost of turning
 a 480x640 render into 480x512.
+
+## Core reuse can keep the soundtrack: re-run the blocks over the prefix
+
+The audio target is ~2% of the sequence - 263 rows against 12,000 for a 6.5 s
+480x640 shot (`audio_t = frames * H3_AUDIO_LATENT_FPS / H3_FPS`, video rows =
+`latent_t * (latent_h/2) * (latent_w/2)`). Freezing it saves nothing and costs
+the speech, so `--core-reuse` should never have been applied to it.
+
+The layout makes the fix cheap. `h3_layout_pack` emits `H3_SEG_AUDIO` before
+`H3_SEG_VIDEO`, and token reduction already asserts that the target video *ends*
+the packed layout. So the audio side is the contiguous prefix `[0,
+video_target_start)` and the video side is the contiguous tail - no repacking
+needed for either half:
+
+- the cached residual goes to the tail only, via a new `h3_gpu_add_bf16_range`
+  that is just a Metal buffer offset;
+- the block loop now runs on reuse steps too, with `core_reuse_audio_pass` set,
+  and `run_block` clamps `rows` to `video_target_start`.
+
+Only a full pass may refresh the cache - after an audio pass the video tail has
+not been through the blocks, so `hidden - core_input` is not a core residual.
+`H3_CORE_REUSE_FREEZE_AUDIO=1` restores the old behaviour as a control.
+
+The approximation: on a reuse step the audio rows attend to text + references +
+audio but not to the (stale) video rows. Full cross-attention returns on every
+evaluate step.
+
+480x640, 158 frames, base 20 steps, seed 42, dialogue-only prompt:
+
+| take | | wall | speech |
+|---|---|---|---|
+| L | no knobs | 6:49 | clean |
+| T | `--core-reuse 4`, audio frozen (old) | 2:46 | doubles for ~0.6 s |
+| S | `--core-reuse 4` + audio pass | **2:55** | **clean** |
+
+The audio pass costs 5.7% over the frozen path and still runs **2.33x faster
+than no knobs at all**. Spectrograms: S has L's dark 2.93-3.52 s gap and sharp
+harmonic stacks; T fills the first 0.6 s. whisper reads S's opening line
+correctly where T gives 「代謝變慢是確立核問題」.
+
+Still open: whether core reuse hurts the *picture* on base Ref2VA. The turbo
+verdict in the section above was measured at 4 steps and does not transfer, but
+the takes here diverge too much in framing to compare quality frame by frame, so
+KaedeStudio still refuses core reuse on ref2va shots.
