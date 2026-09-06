@@ -871,3 +871,36 @@ things block it today, all in h3.c and all arithmetic:
      already written for H3_REF2VA_ANCHOR);
   3. `h3_augment_conditions` and `visual_capacity` split their element
      accounting on `ref2va` and would have to cover both at once.
+
+## FL2VA weights fix the failures; the anchor additionally fixes the framing
+
+Seed 7 is the take that failed every Ref2VA configuration - five of them - by
+falling into a street-interview set with a handheld microphone. Against the wide
+reference, mean |diff| (run-to-run noise 2.5-11) and white-coat score:
+
+| take | weights | anchor | f0 | f60 | coat |
+|---|---|---|---|---|---|
+| Y | Ref2VA, two refs | - | 89.73 | 87.59 | 2.1% |
+| G | Ref2VA + English direction | - | 59.76 | 59.70 | 82.3% |
+| P4 | **FL2VA** | no | 49.11 | 48.81 | **94.4%** |
+| P3 | **FL2VA** | yes | **4.00** | **15.00** | **97.5%** |
+
+Two separate effects, and it took the hard seed to separate them.
+
+**The weights fix the failure.** FL2VA turns seed 7 from a grey suit at a press
+conference into a doctor in a white coat, with or without the anchor. That is
+the whole seed lottery, gone - not mitigated, gone.
+
+**The anchor fixes the framing.** P4 is a correct shot but a wider one than the
+reference; P3 reproduces the reference's framing and *keeps* it - f60 is 15.00,
+inside the range a normal take drifts to as the subject moves. On Ref2VA the
+same anchor collapsed by frame 2. FL2VA is the checkpoint trained to carry a
+frame anchor, and it carries this one.
+
+This corrects an earlier reading. On seed 42 the anchor looked redundant (f0
+4.50 without it against 4.07 with), and it is - on an easy seed the model lands
+on the reference composition anyway. The anchor is insurance for the seeds that
+would not, and seed 7 is what that insurance looks like: 49.11 to 4.00.
+
+So the recipe is `H3_DIT_VARIANT=FL2VA` **and** `H3_REF2VA_ANCHOR=1`, and
+composition stops being a per-seed gamble.
