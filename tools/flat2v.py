@@ -109,8 +109,14 @@ def run_seed(st, seed, turbo, knobs):
     # command-block split and the Qwen prefetch depth already switch on when
     # h3_gpu_is_m5() sees the device; these two do not, and attention is around
     # 40% of the denoise at this size.
-    if st.get("steel", True): env.setdefault("H3_STEEL_ATTN", "1")
+    # int8 VAE is a large, unconditional win here: the video decode goes 54.1s ->
+    # 13.3s at 480x640, a 4.1x cut, not the 22% an earlier note claimed at a
+    # different resolution.
     if st.get("vae_int8", True): env.setdefault("H3_VAE_INT8_FFN", "1")
+    # Steel attention is NOT a win at this size -- measured 68.4s -> 73.6s of
+    # denoise, 7.6% slower. It pays at 1152x640 (858 tokens a frame); at 480x640
+    # (300) the specialised pipeline costs more than it saves. Opt in explicitly.
+    if st.get("steel", False): env.setdefault("H3_STEEL_ATTN", "1")
     cmd = [H3, "-d", st["turbo_dir"] if turbo else st["model_dir"],
            "-p", st["prompt"]]
     for r in st["references"]:
@@ -188,7 +194,7 @@ def cmd_init(a):
           "width": a.width, "height": a.height, "frames": frames,
           "steps": a.steps,
           "model_dir": a.model_dir, "turbo_dir": a.turbo_dir,
-          "steel": not a.no_steel, "vae_int8": not a.no_vae_int8,
+          "steel": a.steel, "vae_int8": not a.no_vae_int8,
           "references": [], "results": {}}
     save(a.workdir, st)
     print(f"  next: crops --first x,y,w,h   (aspect must be "
@@ -256,8 +262,9 @@ def main():
     i.add_argument("--steps", type=int, default=20)
     i.add_argument("--model-dir", default="./MiniMax-H3")
     i.add_argument("--turbo-dir", default="./MiniMax-H3-turbo-int8")
-    i.add_argument("--no-steel", action="store_true",
-                   help="disable H3_STEEL_ATTN (M5 steel attention)")
+    i.add_argument("--steel", action="store_true",
+                   help="enable H3_STEEL_ATTN; measured slower below ~600 "
+                        "tokens a frame, worth trying at 1152x640 and up")
     i.add_argument("--no-vae-int8", action="store_true",
                    help="disable H3_VAE_INT8_FFN (int8 video VAE FFN)")
 

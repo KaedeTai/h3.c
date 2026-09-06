@@ -959,3 +959,64 @@ redundant while anchoring and can be skipped for its 5.7%.
 `H3_REF2VA_ANCHOR_LAST=<m>` pins the m-th reference to the last target frame's
 time, using the same formula as a `--last-frame` keyframe. Passing one still
 twice and anchoring #1 first / #2 last locks both ends of a locked-off shot.
+
+## With the audio anchored, acceleration is a picture question only
+
+Nine turbo takes, FL2VA weights, first+last anchors, 480x640, 158 frames.
+**Every one has an audio waveform correlation of 0.970 against the reference** -
+turbo 4 steps, core reuse, layer skipping, token reduction, three different
+seeds. The soundtrack is correct by construction, so nothing below is about
+audio any more.
+
+| config | wall | f0 | f157 | shut | open | motion |
+|---|---|---|---|---|---|---|
+| turbo 4 | 105-142 s | 4.25 | 4.02 | 44% | 68% | 0.107 |
+| turbo 6 | 175 s | 4.24 | 4.17 | 44% | 72% | 0.115 |
+| turbo 8 | 209 s | 4.29 | 4.25 | 44% | **80%** | **0.122** |
+| turbo 4 + `--layers 45` | 133 s | 4.16 | 4.05 | 46% | 68% | **0.125** |
+| turbo 4 + `--core-reuse 4` | 105 s | 4.20 | 4.09 | 38% | **48%** | 0.108 |
+| turbo 4 + `--token-reduction` | 114 s | **5.70** | **6.92** | 44% | 72% | **0.083** |
+| turbo 4, seed 7 | - | 4.20 | 4.02 | **62%** | 76% | 0.110 |
+| turbo 4, seed 1 | - | 4.18 | 4.13 | **62%** | 76% | 0.099 |
+| turbo 4, seed 3 | - | 4.35 | 4.14 | 44% | 68% | 0.111 |
+
+**`--layers 45` is now free.** It was the worst knob of all - 2.9 s of speech
+doubled over itself - and that damage was entirely to the audio branch. With the
+soundtrack anchored it is harmless and actually the highest-motion take in the
+set, for 25% less time than plain turbo 8.
+
+**`--core-reuse` still costs, but somewhere new.** Mouth-open-while-loud drops
+68% to 48%. It no longer freezes the audio; it stops the picture following it.
+
+**`--token-reduction` loosens the anchors** (f0 4.25 -> 5.70, f157 4.02 -> 6.92)
+and gives the least motion of any take. Skip it.
+
+**More steps buy articulation, not framing.** f0/f157 are flat from 4 to 8 steps;
+open-while-loud climbs 68% -> 72% -> 80%. So step count trades against lip
+detail alone, and 4 steps is usable where 8 is better.
+
+**The seed lottery is gone.** Seeds 7, 1 and 3 all land at f0 ~4.2, f157 ~4.1,
+audio 0.970. Seed 7 - which failed all five Ref2VA configurations by generating
+a street interview - is now among the best takes in the set.
+
+## Two M5 flags, one of which was hurting
+
+| | denoise | video VAE decode |
+|---|---|---|
+| neither flag | 68.4 s | 54.1 s |
+| `H3_STEEL_ATTN=1` | **73.6 s** | 54.2 s |
+| both | 73.3 s | **13.3 s** |
+
+`H3_VAE_INT8_FFN=1` cuts the video decode **4.1x**, 54.1 s to 13.3 s. The "-22%"
+in the section above was measured at another resolution and badly understates it
+here; decode falls from 13% of the run to about 3%.
+
+`H3_STEEL_ATTN=1` is a **7.6% regression** at this size. Steel attention pays at
+1152x640 (858 tokens a frame) and loses at 480x640 (300) -- the specialised
+pipeline costs more than it saves once the sequence is short. tools/flat2v.py
+now sets the VAE flag by default and leaves steel opt-in.
+
+**The audio anchor's sampler cost is zero.** It forces the host sampler because
+the GPU sampler keeps latents on device, and the M5 default is the GPU one -- but
+controlled, same everything else, GPU sampler 73.4 s against host 73.3 s. No
+reason to port the anchor to the GPU path.
