@@ -345,6 +345,39 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
     free(text);
 
     double cursor = (double)spec->text_len;
+
+    /* An ordered reference and a frame anchor differ in exactly one thing: the
+       anchor shares its time coordinate with target frame 0, so RoPE reads it as
+       "this IS frame 0", while a reference gets its own slot and reads as "the
+       subject looks like this, elsewhere in time". Nothing is injected into the
+       target latent either way -- COND and REF_IMAGE take the same DiT path and
+       the same modulation tag.
+
+       H3_REF2VA_ANCHOR=<n> moves the n-th (1-based) reference onto the target
+       video's start time, to see whether a Ref2VA reference can be made to act
+       as a first-frame anchor. Off by default: this is deliberately outside the
+       distribution the model was trained on. */
+    size_t anchor_index = 0;
+    {
+        const char *want = getenv("H3_REF2VA_ANCHOR");
+        if (want && spec->reference_count) {
+            long n = strtol(want, NULL, 10);
+            if (n >= 1 && (size_t)n <= spec->reference_count) anchor_index = (size_t)n;
+        }
+    }
+    double video_origin = cursor;
+    if (anchor_index) {
+        /* Where the target video will start once every reference has taken its
+           slot -- the same arithmetic the reference loop performs below. */
+        for (size_t index = 0; index < spec->reference_count; index++) {
+            const h3_layout_ref *r = &spec->references[index];
+            if (r->kind == H3_LAYOUT_REF_IMAGE) video_origin += 1.0;
+            else if (r->kind == H3_LAYOUT_REF_AUDIO) video_origin += (double)r->audio_t;
+            else video_origin += fmax((double)r->audio_t,
+                                      h3_video_span_sum(r->latent_t));
+        }
+    }
+
     for (size_t index = 0; index < spec->keyframe_count; index++) {
         double condition_time;
         if (spec->keyframes[index] == 0) {
@@ -370,7 +403,9 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
             size_t ref_w_count = 0;
             if (!h3_frame_grid(reference->latent_h, reference->latent_w,
                                &ref_frame, &ref_rows, &ref_w, &ref_w_count)) goto oom;
-            for (size_t row = 0; row < ref_rows; row++) ref_frame[row].t = cursor;
+            double ref_time = (anchor_index && index + 1 == anchor_index)
+                ? video_origin : cursor;
+            for (size_t row = 0; row < ref_rows; row++) ref_frame[row].t = ref_time;
             int ok = h3_emit(&builder, H3_SEG_REF_IMAGE, ref_frame, ref_rows);
             free(ref_frame);
             free(ref_w);

@@ -779,3 +779,51 @@ version scored a take whose speech was pure noise at 100%, because Mandarin
 reuses few enough characters that a bag-of-characters match fills up on
 coincidence. Verified on a known-garbled take, which scores 13.3% under LCS and
 100% under the bag.
+
+## Ref2VA has no first-frame anchor wired up, but the mechanism is one line
+
+A frame anchor and an ordered reference take the same DiT path: `H3_SEG_COND`
+and `H3_SEG_REF_IMAGE` both accumulate into `video_condition`, both draw
+`schedule->visual_condition_rows[step]`, both carry modulation tag 0. Nothing is
+injected into the target latent for either - there is no mask, no inpainting.
+
+They differ in one number. `h3_layout_build` gives a keyframe
+`condition_time = text_len`, which is exactly the time the target video's frame
+0 receives, while each reference takes its own slot (`t = cursor`, `cursor +=
+1.0`) and the target starts after all of them. Sharing the coordinate is what
+makes RoPE read a picture as "this IS frame 0" rather than "the subject looks
+like this, elsewhere in time". That is also why the two cannot be combined: the
+keyframe time is hard-coded to `text_len`, so with references present the anchor
+would no longer land on frame 0, and h3 rejects the combination rather than
+letting it silently degrade.
+
+`H3_REF2VA_ANCHOR=<n>` (new, default off) moves the n-th reference onto the
+target video's start time. Frame 0 against each reference, mean |diff| on 0-255,
+seed 42, where two runs of an identical command differ by 2.5-11:
+
+| take | vs face ref | vs wide ref |
+|---|---|---|
+| A control | 56.63 | **5.77** |
+| B anchor = wide | 57.21 | **4.28** |
+| C anchor = face | **4.50** | 57.81 |
+
+**The mechanism works.** C put the tight face crop at frame 0 where the control
+was 57.81 away from it. But it holds exactly one frame: by frame 2, C has
+snapped back to the wide composition (11.09 from the wide reference), so what it
+buys is a one-frame jump cut.
+
+**And it is not needed.** In a take that works, frame 0 already reproduces the
+reference: the control lands at 5.77, inside the run-to-run noise floor. The
+reference is already a de facto first frame. Anchoring the wide reference (B)
+changed frame 0 by nothing meaningful and made the later frames slightly worse
+(17.73 / 18.34 / 15.02 at frames 20/60/150 against the control's 14.63 / 14.98 /
+11.04) - the off-distribution placement costs consistency and returns nothing.
+
+The seed lottery is therefore not a drift problem. A failed take is wrong from
+frame 0 and stays wrong: seed 7's take measures 89.73 at frame 0 and 86.45 at
+frame 150. The model commits to the wrong shot immediately, which is exactly
+what the English scene description fixes and what no anchor can.
+
+Separately: `--first-frame` reads its image with `H3_IMAGE_FIT_STRETCH`
+(h3.c:1228), same as references (h3.c:1054). Frame anchors have the same aspect
+trap - crop them to the canvas ratio too.
