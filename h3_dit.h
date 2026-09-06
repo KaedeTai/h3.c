@@ -103,6 +103,13 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
                    char *error, size_t error_size);
 
 /* Current serving sampler: independent video/audio shifted Euler grids. */
+/* Audio anchor: a clean [32,2,T] audio latent, T == the target audio_t, that
+ * the sampler treats as known. After every Euler transition the target audio
+ * rows are replaced with that latent re-noised to the step's sigma, so the
+ * soundtrack is given rather than generated and the video rows, which attend
+ * to it, are driven by it. NULL disables. Pointer must outlive the denoise. */
+void h3_dit_set_audio_anchor(h3_dit *dit, const float *anchor);
+
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,

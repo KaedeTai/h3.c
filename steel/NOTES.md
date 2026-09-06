@@ -904,3 +904,58 @@ would not, and seed 7 is what that insurance looks like: 49.11 to 4.00.
 
 So the recipe is `H3_DIT_VARIANT=FL2VA` **and** `H3_REF2VA_ANCHOR=1`, and
 composition stops being a per-seed gamble.
+
+## FLA2V: anchor the soundtrack and the audio stops being generated at all
+
+`H3_AUDIO_ANCHOR=1` keeps the encoded `--ref-audio` as a clean `[32,2,T]`
+latent and, after every Euler transition, replaces the target audio rows with
+it re-noised to the next sigma:
+
+    x_s = (1 - s) * anchor + s * eps        (eps fixed at the initial noise)
+
+h3's sampler is flow matching with `v = x0 - eps`, so that expression is exactly
+the known latent at each sigma, and at the final step `s = 0` makes the audio
+rows *be* the reference. The video rows attend to them, so the picture is driven
+by the real soundtrack instead of one the model invented.
+
+The reference has to encode to exactly `temporal.audio_t` latent frames
+(`frames * 40 / 24`), so pad or trim the clip first - 158 frames needs 263
+frames of latent, which is 6.575 s. h3 refuses with the required duration rather
+than silently misaligning.
+
+Measured on the first take, 480x640, 158 frames, base 20 steps, seed 42, against
+the same configuration with the audio generated (P2):
+
+| | Q1 anchored | P2 generated |
+|---|---|---|
+| waveform correlation with the reference | **0.970 @ 0 ms** | - |
+| envelope correlation | **0.999** | - |
+| transcript | exact, timestamps match the source | garbles on other seeds |
+| mouth shut while the audio is silent | **44%** | 14% |
+| mouth open while the audio is loud | 76% | 76% |
+| frame 0 vs the reference image | 4.07 | 4.07 |
+| frames 20/60/150 vs reference | 12.68 / 16.03 / 12.93 | 16.19 / 15.34 / 17.18 |
+
+Confirmed by ear: the lip sync is correct. Note the permutation-null z read only
+1.72 ("weak") on a take that is audibly right, so that metric under-reads on
+three-sentence lines with pauses - trust the silent-shut/loud-open pair and the
+ear over the z.
+
+The picture anchor is untouched (frame 0 identical at 4.07) and the later frames
+sit *closer* to the reference than the unanchored take, which is what removing a
+degree of freedom should do.
+
+**What this changes about acceleration.** Every knob that was ruled out did its
+damage to the audio branch: `--layers 45` doubled the speech, `--core-reuse`
+froze it. With the anchor, whatever the DiT produces for the audio rows is
+overwritten before the next step, so that damage cannot survive. The soundtrack
+is correct by construction at any step count. Acceleration therefore stops being
+a question about audio at all and becomes purely a question about the picture.
+
+Also: `core_reuse_audio_pass` (re-running the blocks over the prefix on a reuse
+step) exists to protect exactly the rows the anchor now overwrites, so it is
+redundant while anchoring and can be skipped for its 5.7%.
+
+`H3_REF2VA_ANCHOR_LAST=<m>` pins the m-th reference to the last target frame's
+time, using the same formula as a `--last-frame` keyframe. Passing one still
+twice and anchoring #1 first / #2 last locks both ends of a locked-off shot.

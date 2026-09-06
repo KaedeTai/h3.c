@@ -106,6 +106,8 @@ struct h3_dit {
        the contiguous tail. Keeps the soundtrack denoising while the video rows
        take the cached residual. */
     int core_reuse_audio_pass;
+    /* See h3_dit_set_audio_anchor. */
+    const float *audio_anchor;
     unsigned core_forward_count;
     int core_residual_ready;
     unsigned active_block_count;
@@ -2648,6 +2650,7 @@ static int parse_reuse_steps(int steps, uint8_t *selected) {
 }
 
 static int gpu_sampler_requested(const h3_dit *dit) {
+    if (dit->audio_anchor) return 0;   /* anchor is host-side for now */
     const char *cpu = getenv("H3_CPU_SAMPLER");
     if (cpu && *cpu && strcmp(cpu, "0")) return 0;
     const char *value = getenv("H3_GPU_SAMPLER");
@@ -2929,6 +2932,10 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
     return ok;
 }
 
+void h3_dit_set_audio_anchor(h3_dit *dit, const float *anchor) {
+    if (dit) dit->audio_anchor = anchor;
+}
+
 int h3_dit_denoise_euler_preview(
                          h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
@@ -2986,6 +2993,21 @@ int h3_dit_denoise_euler_preview(
         free(previous_audio);
         return 0;
     }
+    float *anchor_noise = NULL;
+    if (dit->audio_anchor) {
+        anchor_noise = malloc(audio_count * sizeof(*anchor_noise));
+        if (!anchor_noise) {
+            fail(error, error_size, "out of memory for the audio anchor noise");
+            free(video_velocity); free(audio_velocity);
+            free(last_video); free(previous_video);
+            free(last_audio); free(previous_audio);
+            return 0;
+        }
+        memcpy(anchor_noise, audio_latent, audio_count * sizeof(*anchor_noise));
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: audio anchor active, %zu latent elements\n",
+                    audio_count);
+    }
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
@@ -3033,6 +3055,16 @@ int h3_dit_denoise_euler_preview(
                      dit->sigmas.audio[step], dit->sigmas.audio[step + 1]);
             if (!ok) fail(error, error_size,
                           "Euler solver rejected step %d", step);
+            if (ok && dit->audio_anchor) {
+                /* Flow matching here is x_s = (1 - s) x0 + s eps with the
+                   velocity v = x0 - eps, so the known latent at the next sigma
+                   is exactly this. At the last step s = 0 and the audio rows
+                   ARE the reference. */
+                float s_next = dit->sigmas.audio[step + 1];
+                for (size_t i = 0; i < audio_count; i++)
+                    audio_latent[i] = (1.0f - s_next) * dit->audio_anchor[i] +
+                                      s_next * anchor_noise[i];
+            }
         }
         if (ok && preview &&
             preview(step + 1, dit->sigmas.steps, video_latent, video_count,
@@ -3044,6 +3076,7 @@ int h3_dit_denoise_euler_preview(
         if (ok) report(progress, progress_opaque, "denoise", step + 1,
                        dit->sigmas.steps);
     }
+    free(anchor_noise);
     free(video_velocity);
     free(audio_velocity);
     free(last_video);

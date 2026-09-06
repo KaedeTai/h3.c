@@ -357,16 +357,26 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
        video's start time, to see whether a Ref2VA reference can be made to act
        as a first-frame anchor. Off by default: this is deliberately outside the
        distribution the model was trained on. */
-    size_t anchor_index = 0;
+    size_t anchor_index = 0, anchor_last_index = 0;
     {
         const char *want = getenv("H3_REF2VA_ANCHOR");
         if (want && spec->reference_count) {
             long n = strtol(want, NULL, 10);
             if (n >= 1 && (size_t)n <= spec->reference_count) anchor_index = (size_t)n;
         }
+        /* H3_REF2VA_ANCHOR_LAST=<m>: the m-th reference takes the LAST target
+           frame's time coordinate, the way --last-frame does. Pass the same
+           image twice and anchor #1 first / #2 last to pin both ends of a
+           locked-off shot to one still. */
+        want = getenv("H3_REF2VA_ANCHOR_LAST");
+        if (want && spec->reference_count) {
+            long n = strtol(want, NULL, 10);
+            if (n >= 1 && (size_t)n <= spec->reference_count &&
+                (size_t)n != anchor_index) anchor_last_index = (size_t)n;
+        }
     }
     double video_origin = cursor;
-    if (anchor_index) {
+    if (anchor_index || anchor_last_index) {
         /* Where the target video will start once every reference has taken its
            slot -- the same arithmetic the reference loop performs below. */
         for (size_t index = 0; index < spec->reference_count; index++) {
@@ -403,8 +413,12 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
             size_t ref_w_count = 0;
             if (!h3_frame_grid(reference->latent_h, reference->latent_w,
                                &ref_frame, &ref_rows, &ref_w, &ref_w_count)) goto oom;
-            double ref_time = (anchor_index && index + 1 == anchor_index)
-                ? video_origin : cursor;
+            double ref_time = cursor;
+            if (anchor_index && index + 1 == anchor_index)
+                ref_time = video_origin;
+            else if (anchor_last_index && index + 1 == anchor_last_index)
+                ref_time = video_origin + h3_video_span_sum(spec->latent_t) -
+                           h3_frame_rescale;   /* same formula as a last keyframe */
             for (size_t row = 0; row < ref_rows; row++) ref_frame[row].t = ref_time;
             int ok = h3_emit(&builder, H3_SEG_REF_IMAGE, ref_frame, ref_rows);
             free(ref_frame);

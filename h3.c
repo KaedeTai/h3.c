@@ -896,6 +896,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     size_t condition_video_elements = 0;
     float *condition_audio_rows = NULL;
     size_t condition_audio_elements = 0;
+    /* H3_AUDIO_ANCHOR=1: keep the encoded reference audio as a [32,2,T]
+       latent and hand it to the sampler as a known soundtrack. */
+    float *audio_anchor = NULL;
+    int want_audio_anchor = getenv("H3_AUDIO_ANCHOR") &&
+        *getenv("H3_AUDIO_ANCHOR") && strcmp(getenv("H3_AUDIO_ANCHOR"), "0");
     h3_text_embedding text;
     memset(&text, 0, sizeof(text));
     h3_layout layout;
@@ -1230,6 +1235,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             total_audio_samples += (size_t)samples;
             layout_references[index].audio_t = latent.length;
             presentations[index].has_audio = 1;
+            if (want_audio_anchor && !audio_anchor) {
+                if (latent.length != temporal.audio_t) {
+                    h3_audio_latent_free(&latent);
+                    h3_set_error(ctx,
+                        "audio anchor: reference encodes to %d latent frames "
+                        "but the target needs %d (%d video frames); pad or "
+                        "trim the clip to %.3f s",
+                        latent.length, temporal.audio_t, temporal.frame_count,
+                        (double)temporal.audio_t / H3_AUDIO_LATENT_FPS);
+                    goto cleanup;
+                }
+                audio_anchor = malloc(elements * sizeof(*audio_anchor));
+                if (!audio_anchor) {
+                    h3_audio_latent_free(&latent);
+                    h3_set_error(ctx, "out of memory keeping the audio anchor");
+                    goto cleanup;
+                }
+                /* encoder output is already [32,2,T], the decoder's order */
+                memcpy(audio_anchor, latent.values,
+                       elements * sizeof(*audio_anchor));
+                fprintf(stderr, "h3: audio anchor: reference %d latent frames "
+                        "will be the soundtrack\n", latent.length);
+            }
             h3_audio_latent_free(&latent);
             if (progress.cancelled) goto cleanup;
         }
@@ -1548,6 +1576,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     condition_video_rows = NULL;
     free(condition_audio_rows);
     condition_audio_rows = NULL;
+    /* audio_anchor stays alive: the sampler below reads it every step */
     if (progress.cancelled) goto cleanup;
     if (params->preview_denoise) {
         h3_progress_emit(&progress, "preview VAE load", 0, 36);
@@ -1586,6 +1615,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    if (want_audio_anchor && !audio_anchor) {
+        h3_set_error(ctx, "H3_AUDIO_ANCHOR needs a --ref-audio clip encoded in "
+                          "this run (not a conditioning-cache hit)");
+        goto cleanup;
+    }
+    h3_dit_set_audio_anchor(dit, audio_anchor);
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
@@ -1601,6 +1636,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         goto cleanup;
     }
+    if (dit) h3_dit_set_audio_anchor(dit, NULL);
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
@@ -1728,6 +1764,7 @@ cleanup:
     free(presentation_timestamps);
     free(layout_references);
     free(condition_video_rows);
+    free(audio_anchor);
     free(condition_audio_rows);
     h3_text_embedding_free(&text);
     h3_layout_free(&layout);
