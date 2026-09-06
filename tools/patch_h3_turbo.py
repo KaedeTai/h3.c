@@ -11,6 +11,12 @@ reproduce.
 This copies the original shards byte-for-byte and then overwrites only the
 bytes of the 208 tensors the LoRA touches. Same dtype, same shape, same offsets,
 same header -- the only thing that changes is the numbers.
+
+Output is BF16, because the byte-patch has to match the original container. The
+runtime default is now the int8 bundle (~/h3.c/MiniMax-H3-turbo-int8), so after
+re-running this, feed its output through tools/quantize_h3_int8.py before the
+consumers (KaedeStudio, longshot.py, the kaedecode sidecar) will pick it up. The
+BF16 bundle this writes is archived on external storage, not kept on the SSD.
 """
 import json, os, shutil, struct, sys, time
 import mlx.core as mx

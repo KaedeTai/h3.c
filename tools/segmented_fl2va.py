@@ -20,7 +20,7 @@ Everything runs in ONE interactive h3 session so the model loads once.
 
 Spec (JSON):
 {
-  "model": "./MiniMax-H3-turbo", "width": 1152, "height": 640,
+  "model": "./MiniMax-H3-turbo-int8", "width": 1152, "height": 640,
   "segment_seconds": 3, "seed": 7,
   "h3_args": ["--steps", "4", "--use-int8-row-fc2"],      # extra CLI flags
   "first_frame": null,                                     # optional PNG

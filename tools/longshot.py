@@ -13,7 +13,7 @@ only this segment's change - never the whole arc.
 Script (JSON):
 {
   "name": "timelapse", "width": 1152, "height": 640, "seed": 7,
-  "model": "./MiniMax-H3-turbo",
+  "model": "./MiniMax-H3-turbo-int8",
   "h3_args": ["--steps", "4", "--use-int8-row-fc2", "--layers", "45"],
   "world": "shared description of the scene / UI / cursor / sound. NO process narrative
             (nothing like 'starts blank and builds up') - that belongs in the beats.",
@@ -66,7 +66,7 @@ def load_script(path):
             print(f"warning: 'world' contains '{w}' - process narrative there makes every segment "
                   f"replay the whole arc; move it into the beats", file=sys.stderr)
     s.setdefault("subject", "")
-    s.setdefault("model", "./MiniMax-H3-turbo"); s.setdefault("h3_args", DEFAULT_H3_ARGS)
+    s.setdefault("model", "./MiniMax-H3-turbo-int8"); s.setdefault("h3_args", DEFAULT_H3_ARGS)
     s.setdefault("preview_seconds", 3); s.setdefault("seam_drop", 8); s.setdefault("seed", 7)
     s.setdefault("audio", {}); s.setdefault("post", {})
     s["audio"] = {"keep_h3_audio": False, "music": None, "music_gain_db": -8, "fade_s": 1.5, **s["audio"]}

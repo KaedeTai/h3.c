@@ -1,6 +1,8 @@
 # Local models, references, experiments, and generated media.
 misc/
 MiniMax-H3/
+MiniMax-H3-turbo/
+MiniMax-H3-turbo-int8/
 outputs/
 .ruff_cache/
 
@@ -28,3 +30,6 @@ h3_real_video_vae_test
 h3_semantic_vae_test
 libh3.a
 .DS_Store
+
+# Python caches.
+__pycache__/

@@ -349,3 +349,13 @@ file". The converter now writes both.
 `MiniMax-H3-turbo-int8/` is built with hardlinks to the shared text encoder and
 VAEs, so it costs 88 GB on top of the BF16 bundles rather than 161 GB. Deleting
 `MiniMax-H3-turbo/` once the int8 bundle is trusted frees 123 GB.
+
+**int8 is the default everywhere as of 2026-09-06.** `MiniMax-H3-turbo/` (BF16)
+was archived to `/Volumes/2T/h3-models/MiniMax-H3-turbo` and removed from the
+SSD; the external copy is exFAT, so the hardlinks materialise and it occupies
+~269 GB there rather than 123 GB. Consumers now point at
+`MiniMax-H3-turbo-int8/`: KaedeStudio `StudioSettings.h3LocalTurboModelDir`,
+`tools/longshot.py`, `tools/segmented_fl2va.py`, and the kaedecode sidecar
+(which prefers int8 -> turbo -> base, whichever exists first).
+`tools/patch_h3_turbo.py` still emits BF16 by design - its output has to be
+re-quantized before anything will use it.
