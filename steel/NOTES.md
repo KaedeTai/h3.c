@@ -583,3 +583,51 @@ Still open: whether core reuse hurts the *picture* on base Ref2VA. The turbo
 verdict in the section above was measured at 4 steps and does not transfer, but
 the takes here diverge too much in framing to compare quality frame by frame, so
 KaedeStudio still refuses core reuse on ref2va shots.
+
+### Does core reuse hurt the picture on base Ref2VA? Not measurably.
+
+First attempt said yes, and it was wrong twice over.
+
+Whole-frame sharpness put L (no knobs) at 11.84 Laplacian against S's 9.28 - but
+L's background is a wall of fine certificate text and S's is a plainer shelf, so
+that compares content. The giveaway was the anisotropy: S read -7.05 dB
+horizontal-vs-vertical without ever touching `--token-reduction`, which is
+impossible as a filtering effect and obvious as a content effect (S wears a
+striped tie in front of vertical shelf edges).
+
+Restricting to the face - same person, same light, cropped by skin tone, resized
+to a common width and contrast-normalised - and adding a second seed:
+
+| | no knobs | core-reuse 4 |
+|---|---|---|
+| seed 42 | 0.2896 | 0.2608 (-10%) |
+| seed 7 | 0.1981 | **0.2227 (+12%)** |
+
+The two seeds disagree in sign, and seed-to-seed spread (0.198 to 0.290, 46%) is
+four times the knob effect. So there is no detectable picture penalty; there is
+also not enough evidence to claim there is none. Two seeds is two seeds.
+
+### The wardrobe drift is the seed, not the knob
+
+At seed 42 the split looked perfect: L and P (no knobs, token-reduction) kept the
+white coat; N, O, S and U (layers 45, core-reuse) all put the doctor in a dark
+suit. Four against two, one mechanism - core reuse stops re-reading the
+reference - and it matched the old turbo verdict exactly.
+
+Seed 7 killed it. **Both** seed-7 takes drift: the unknobbed one is in a dark
+suit too, and it moves the subtitles to the top of the frame; the core-reuse one
+adds a handheld press microphone and a news-interview set. The knob had nothing
+to do with it.
+
+A dialogue-only prompt gives the model no visual anchor at all, so wardrobe,
+background and even subtitle placement are decided by the seed. Widening the
+reference to include the chest and the white coat (take U) did not fix it either
+- so this is not "the reference does not show enough coat", it is the prompt
+carrying no visual constraint while the reference only pins the face.
+
+Identity survives everywhere: it is the same man in all eight takes. What drifts
+is everything the reference crop does not cover.
+
+Practical consequence: a talking-head shot needs more than one roll. That is
+affordable now - core-reuse 4 with the audio pass is 2:55 against 6:49 - so the
+speedup buys takes rather than buying a single faster take.
