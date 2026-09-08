@@ -111,18 +111,37 @@ def native_prefix(name):
     return None, name
 
 
-def dtype_table(reference):
-    from safetensors import safe_open
-    index = os.path.join(reference, "model.safetensors.index.json")
-    with open(index) as f:
-        weight_map = json.load(f)["weight_map"]
-    table = {}
-    opened = {}
-    for name, shard in weight_map.items():
-        if shard not in opened:
-            opened[shard] = safe_open(os.path.join(reference, shard), "pt")
-        table[name] = opened[shard].get_slice(name).get_dtype()
-    return table
+SIDECAR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "native_layout", "h3_dit_native.json")
+
+
+def native_layout(reference):
+    """(dtype table, rope.inv_freq) -- from a real bundle, or from the sidecar.
+
+    The loader is strict about dtype and asks for F32 for thirteen tensors --
+    the patch projections, the time embedder, the output heads -- where the
+    diffusers checkpoints store everything BF16. And rope.inv_freq is a stored
+    tensor natively and a computed constant in the diffusers port. That is the
+    entire dependency on a native bundle, so it is kept as a file instead.
+    """
+    if reference:
+        from safetensors import safe_open
+        index = os.path.join(reference, "model.safetensors.index.json")
+        with open(index) as f:
+            weight_map = json.load(f)["weight_map"]
+        table, opened = {}, {}
+        for name, shard in weight_map.items():
+            if shard not in opened:
+                opened[shard] = safe_open(os.path.join(reference, shard), "pt")
+            table[name] = opened[shard].get_slice(name).get_dtype()
+        rope = safe_open(os.path.join(reference, weight_map["rope.inv_freq"]),
+                         "pt").get_tensor("rope.inv_freq")
+        return table, rope
+    with open(SIDECAR) as f:
+        data = json.load(f)
+    import torch
+    return data["dtypes"], torch.tensor(data["rope_inv_freq"],
+                                        dtype=torch.float32)
 
 
 def main():
@@ -130,9 +149,9 @@ def main():
             formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("source", help="diffusers transformer/ directory")
     ap.add_argument("out", help="native transformer/ directory to write")
-    ap.add_argument("--reference", default=os.path.expanduser(
-        "~/h3.c/MiniMax-H3-slim/FL2VA/transformer"),
-        help="a native bundle, read for dtypes and rope.inv_freq")
+    ap.add_argument("--reference", default=None,
+        help="a native bundle to read dtypes and rope.inv_freq from; by "
+             "default they come from native_layout/h3_dit_native.json")
     ap.add_argument("--shard-bytes", type=int, default=4_500_000_000)
     ap.add_argument("--dry-run", action="store_true",
                     help="map names only; touch no tensor data")
@@ -145,8 +164,9 @@ def main():
 
     if not DRY:
         os.makedirs(a.out, exist_ok=True)
-    want = dtype_table(a.reference)
-    print(f"reference declares {len(want)} tensors")
+    want, rope = native_layout(a.reference)
+    print(f"native layout declares {len(want)} tensors "
+          f"({'bundle: ' + a.reference if a.reference else 'from the sidecar'})")
 
     src_index = os.path.join(
         a.source, "diffusion_pytorch_model.safetensors.index.json")
@@ -229,12 +249,7 @@ def main():
         print(f"  ! unmapped tensor: {name}")
 
     # rope.inv_freq is computed in the diffusers port and stored in the native
-    # one; the architecture is identical, so copy it across.
-    ref_index = os.path.join(a.reference, "model.safetensors.index.json")
-    with open(ref_index) as f:
-        ref_map = json.load(f)["weight_map"]
-    rope = safe_open(os.path.join(a.reference, ref_map["rope.inv_freq"]),
-                     "pt").get_tensor("rope.inv_freq")
+    # one; the architecture is identical, so it is carried across verbatim.
     emit("rope.inv_freq", rope)
     flush()
 

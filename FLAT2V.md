@@ -567,10 +567,14 @@ against each other tensor by tensor over HTTP range requests, a few hundred rows
 at a time, with no 70 GB download. Twenty tensors matched byte-for-byte; two did
 not, and those two were the bugs.
 
-The dtype table is read from a real native bundle rather than hardcoded: the
-loader is strict, and wants F32 for the patch projections, the time embedder and
-the output heads where diffusers stores everything BF16. `rope.inv_freq` is
-stored natively and computed in diffusers, so it is copied across.
+Two smaller differences: the loader is strict about dtype and wants F32 for
+thirteen tensors — the patch projections, the time embedder, the output heads —
+where the diffusers checkpoints store everything BF16; and `rope.inv_freq` is a
+stored tensor natively and a computed constant in the diffusers port. That is
+the whole dependency on a native bundle, so it lives in
+`tools/native_layout/h3_dit_native.json` — **23 KB instead of 48 GB**. Verified
+identical to what the bundle yields: same 535 dtypes, rope difference 0.0.
+`--reference <bundle>` regenerates it if MiniMax ever change the layout.
 
 **Why this had to be checked against weights and not against output.** With the
 QKV wrong and `fc1` right, the video was pure colour static — obvious. With both
