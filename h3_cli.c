@@ -166,6 +166,7 @@ static void print_help(void) {
     puts("  !first [PATH|clear]      Set, show, or clear first frame");
     puts("  !last [PATH|clear]       Set, show, or clear last frame");
     puts("  !ref-image PATH          Append an ordered Ref2VA image");
+    puts("  !ref-audio PATH          Append an ordered standalone audio clip");
     puts("  !refs [clear]            List or clear ordered references");
     puts("  !ref-remove N            Remove ordered reference N");
     puts("  !show [on|off]           Toggle denoising previews");
@@ -235,6 +236,16 @@ static int validate_anchor(const char *path) {
     return 0;
 }
 
+/* A standalone audio reference has no visual stream, so validate_anchor rejects
+   it -- which is how !ref-audio silently added nothing on its first outing.
+   Existence is all that can usefully be checked here; the audio VAE encoder
+   reports anything else with a better message than ffprobe would. */
+static int validate_audio(const char *path) {
+    if (!access(path, R_OK)) return 1;
+    fprintf(stderr, "h3: cannot read %s: %s\n", path, strerror(errno));
+    return 0;
+}
+
 static const char *reference_kind_name(h3_reference_kind kind) {
     switch (kind) {
     case H3_REFERENCE_IMAGE: return "image";
@@ -271,7 +282,7 @@ static void clear_references(h3_cli_state *state) {
     for (size_t index = 0; index < state->params.reference_count; index++)
         free_reference(&state->references[index]);
     state->params.reference_count = 0;
-    h3_cache_clear(state->ctx);
+    h3_cache_clear_conditioning(state->ctx);
 }
 
 static void list_references(const h3_cli_state *state) {
@@ -333,10 +344,12 @@ int h3_warn_ref2va_knobs(const h3_params *params) {
     return 1;
 }
 
-static void add_reference_image(h3_cli_state *state, char *argument) {
+static void add_reference(h3_cli_state *state, char *argument,
+                          h3_reference_kind kind) {
+    const char *label = kind == H3_REFERENCE_AUDIO ? "!ref-audio" : "!ref-image";
     argument = skip_spaces(argument);
     if (!*argument) {
-        fprintf(stderr, "Usage: !ref-image PATH\n");
+        fprintf(stderr, "Usage: %s PATH\n", label);
         return;
     }
     if (state->first_frame || state->last_frame) {
@@ -344,13 +357,13 @@ static void add_reference_image(h3_cli_state *state, char *argument) {
         return;
     }
     if (!h3_model(state->ctx)->ref2va_transformer.files) {
-        fprintf(stderr, "h3: !ref-image requires the Ref2VA checkpoint\n");
+        fprintf(stderr, "h3: %s requires the Ref2VA checkpoint\n", label);
         return;
     }
     size_t images = 0;
     for (size_t index = 0; index < state->params.reference_count; index++)
         if (state->references[index].kind == H3_REFERENCE_IMAGE) images++;
-    if (images >= 9) {
+    if (kind == H3_REFERENCE_IMAGE && images >= 9) {
         fprintf(stderr, "h3: Ref2VA supports at most 9 image references\n");
         return;
     }
@@ -358,17 +371,24 @@ static void add_reference_image(h3_cli_state *state, char *argument) {
         fprintf(stderr, "h3: Ref2VA supports at most 12 ordered references\n");
         return;
     }
-    if (!validate_anchor(argument)) return;
+    if (kind == H3_REFERENCE_AUDIO ? !validate_audio(argument)
+                                   : !validate_anchor(argument)) return;
     char *path = strdup(argument);
     if (!path) {
         fprintf(stderr, "h3: out of memory copying reference path\n");
         return;
     }
     size_t index = state->params.reference_count++;
-    state->references[index] = (h3_reference){H3_REFERENCE_IMAGE, path, NULL, 0};
-    h3_cache_clear(state->ctx);
-    printf("Added reference %zu as <Picture %zu>: %s\n",
-           index + 1, images + 1, path);
+    state->references[index] = (h3_reference){kind, path, NULL, 0};
+    /* Conditioning only: a new reference says nothing about the DiT weights or
+       the video decoder, and a segmented render swaps a reference every
+       segment. Clearing everything here cost ~8 s a segment for nothing. */
+    h3_cache_clear_conditioning(state->ctx);
+    if (kind == H3_REFERENCE_AUDIO)
+        printf("Added reference %zu as the soundtrack: %s\n", index + 1, path);
+    else
+        printf("Added reference %zu as <Picture %zu>: %s\n",
+               index + 1, images + 1, path);
 }
 
 static void remove_reference(h3_cli_state *state, char *argument) {
@@ -385,7 +405,7 @@ static void remove_reference(h3_cli_state *state, char *argument) {
     state->params.reference_count--;
     memset(&state->references[state->params.reference_count], 0,
            sizeof(state->references[0]));
-    h3_cache_clear(state->ctx);
+    h3_cache_clear_conditioning(state->ctx);
     printf("Removed reference %d.\n", number);
     list_references(state);
 }
@@ -401,7 +421,7 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
     if (!strcasecmp(argument, "clear")) {
         free(*slot);
         *slot = NULL;
-        h3_cache_clear(state->ctx);
+        h3_cache_clear_conditioning(state->ctx);
         printf("%s: none\n", name);
         return;
     }
@@ -417,7 +437,7 @@ static void set_anchor(h3_cli_state *state, int first, char *argument) {
     }
     free(*slot);
     *slot = copy;
-    h3_cache_clear(state->ctx);
+    h3_cache_clear_conditioning(state->ctx);
     printf("%s: %s\n", name, *slot);
 }
 
@@ -648,8 +668,10 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         }
     } else if (!strcasecmp(command, "first")) set_anchor(state, 1, argument);
     else if (!strcasecmp(command, "last")) set_anchor(state, 0, argument);
+    else if (!strcasecmp(command, "ref-audio"))
+        add_reference(state, argument, H3_REFERENCE_AUDIO);
     else if (!strcasecmp(command, "ref-image"))
-        add_reference_image(state, argument);
+        add_reference(state, argument, H3_REFERENCE_IMAGE);
     else if (!strcasecmp(command, "refs")) {
         if (!*argument) list_references(state);
         else if (!strcasecmp(argument, "clear")) {
@@ -700,7 +722,7 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         }
     } else if (!strcasecmp(command, "cache")) {
         if (!strcasecmp(argument, "clear")) {
-            h3_cache_clear(state->ctx);
+            h3_cache_clear(state->ctx);          /* the user asked for all of it */
             puts("Cache cleared.");
         } else if (*argument) {
             fprintf(stderr, "h3: use !cache or !cache clear\n");

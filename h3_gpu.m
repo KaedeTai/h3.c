@@ -814,6 +814,92 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
         opaque, path, file_offset, elements, 0, error, error_size);
 }
 
+static inline uint16_t h3_bf16_of_f32(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    /* round to nearest even on the top 16 bits, matching the export */
+    return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
+int h3_gpu_tensor_read_file_int4_group(h3_gpu_tensor *opaque, const char *path,
+                                       uint64_t packed_offset,
+                                       uint64_t scale_offset,
+                                       size_t elements, size_t group,
+                                       char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!opaque || !path || !*path || TENSOR(opaque).dtype != H3_GPU_BF16 ||
+        elements != TENSOR(opaque).elements || !group || elements % group ||
+        group % 2 || elements > SIZE_MAX / 2) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid int4 file read request");
+        return 0;
+    }
+    size_t groups = elements / group;
+    size_t packed_bytes = elements / 2;
+    size_t scale_bytes = groups * sizeof(uint16_t);
+    unsigned char *packed = malloc(packed_bytes);
+    uint16_t *scales = malloc(scale_bytes);
+    if (!packed || !scales) {
+        free(packed); free(scales);
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory staging int4 payload");
+        return 0;
+    }
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        free(packed); free(scales);
+        if (error && error_size)
+            snprintf(error, error_size, "cannot open %s: %s", path,
+                     strerror(errno));
+        return 0;
+    }
+    int ok = 1;
+    struct { void *base; size_t bytes; uint64_t offset; } parts[2] = {
+        {packed, packed_bytes, packed_offset},
+        {scales, scale_bytes, scale_offset}};
+    for (int part = 0; part < 2 && ok; part++) {
+        size_t completed = 0;
+        unsigned char *destination = parts[part].base;
+        while (completed < parts[part].bytes) {
+            size_t request = MIN(parts[part].bytes - completed, (size_t)SSIZE_MAX);
+            ssize_t count = pread(descriptor, destination + completed, request,
+                                  (off_t)(parts[part].offset + completed));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                if (error && error_size)
+                    snprintf(error, error_size,
+                             "cannot read int4 payload from %s: %s", path,
+                             count < 0 ? strerror(errno) :
+                                         "unexpected end of file");
+                ok = 0;
+                break;
+            }
+            completed += (size_t)count;
+        }
+    }
+    close(descriptor);
+    if (ok) {
+        uint16_t *destination = TENSOR(opaque).buffer.contents;
+        for (size_t g = 0; g < groups; g++) {
+            __fp16 half;
+            memcpy(&half, &scales[g], sizeof(half));
+            float scale = (float)half;
+            uint16_t table[16];
+            for (int q = 0; q < 16; q++)
+                table[q] = h3_bf16_of_f32((float)(q - 8) * scale);
+            const unsigned char *source = packed + g * (group / 2);
+            uint16_t *row = destination + g * group;
+            for (size_t j = 0; j < group / 2; j++) {
+                unsigned char byte = source[j];
+                row[2 * j] = table[byte & 0x0Fu];
+                row[2 * j + 1] = table[byte >> 4];
+            }
+        }
+    }
+    free(packed); free(scales);
+    return ok;
+}
+
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size) {

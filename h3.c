@@ -35,12 +35,14 @@ static void h3_conditioning_cache_clear(h3_ctx *ctx) {
     free(ctx->conditioning_tags);
     free(ctx->conditioning_video_rows);
     free(ctx->conditioning_audio_rows);
+    free(ctx->conditioning_audio_anchor);
     free(ctx->conditioning_references);
     ctx->conditioning_key = NULL;
     ctx->conditioning_values = NULL;
     ctx->conditioning_tags = NULL;
     ctx->conditioning_video_rows = NULL;
     ctx->conditioning_audio_rows = NULL;
+    ctx->conditioning_audio_anchor = NULL;
     ctx->conditioning_references = NULL;
     ctx->conditioning_tokens = 0;
     ctx->conditioning_width = 0;
@@ -48,6 +50,10 @@ static void h3_conditioning_cache_clear(h3_ctx *ctx) {
     ctx->conditioning_audio_elements = 0;
     ctx->conditioning_reference_count = 0;
     ctx->conditioning_present = 0;
+}
+
+void h3_cache_clear_conditioning(h3_ctx *ctx) {
+    h3_conditioning_cache_clear(ctx);
 }
 
 void h3_cache_clear(h3_ctx *ctx) {
@@ -220,12 +226,21 @@ static int h3_conditioning_cache_store(
         h3_ctx *ctx, const char *key, const h3_text_embedding *text,
         const float *video, size_t video_elements,
         const float *audio, size_t audio_elements,
+        const float *anchor, size_t anchor_elements,
         const h3_layout_ref *references, size_t reference_count,
         int conditioned) {
     h3_text_embedding copy;
     if (!h3_text_embedding_copy(&copy, text)) return 0;
     float *video_copy = NULL;
     float *audio_copy = NULL;
+    /* The audio ANCHOR is not the audio condition rows. The condition rows are
+       the patchified REF_AUDIO segment; the anchor is the raw [32,2,T] encoder
+       output that gets written into the target audio rows at every step. On a
+       conditioning-cache hit the encode is skipped, so without keeping this the
+       anchor has nothing to write and the whole recipe refuses to run in the
+       resident path -- which is exactly the path a seed sweep or a segmented
+       long-form render wants. */
+    float *anchor_copy = NULL;
     h3_layout_ref *reference_copy = NULL;
     char *key_copy = strdup(key);
     if (video_elements) {
@@ -238,6 +253,11 @@ static int h3_conditioning_cache_store(
         if (audio_copy) memcpy(audio_copy, audio,
                                audio_elements * sizeof(*audio_copy));
     }
+    if (anchor_elements) {
+        anchor_copy = malloc(anchor_elements * sizeof(*anchor_copy));
+        if (anchor_copy) memcpy(anchor_copy, anchor,
+                                anchor_elements * sizeof(*anchor_copy));
+    }
     if (reference_count) {
         reference_copy = malloc(reference_count * sizeof(*reference_copy));
         if (reference_copy) memcpy(reference_copy, references,
@@ -245,8 +265,10 @@ static int h3_conditioning_cache_store(
     }
     if (!key_copy || (video_elements && !video_copy) ||
         (audio_elements && !audio_copy) ||
+        (anchor_elements && !anchor_copy) ||
         (reference_count && !reference_copy)) {
-        free(key_copy); free(video_copy); free(audio_copy); free(reference_copy);
+        free(key_copy); free(video_copy); free(audio_copy); free(anchor_copy);
+        free(reference_copy);
         h3_text_embedding_free(&copy);
         return 0;
     }
@@ -260,6 +282,8 @@ static int h3_conditioning_cache_store(
     ctx->conditioning_video_elements = video_elements;
     ctx->conditioning_audio_rows = audio_copy;
     ctx->conditioning_audio_elements = audio_elements;
+    ctx->conditioning_audio_anchor = anchor_copy;
+    ctx->conditioning_audio_anchor_elements = anchor_elements;
     ctx->conditioning_references = reference_copy;
     ctx->conditioning_reference_count = reference_count;
     ctx->conditioning_present = conditioned;
@@ -270,6 +294,7 @@ static int h3_conditioning_cache_load(
         const h3_ctx *ctx, h3_text_embedding *text,
         float **video, size_t *video_elements,
         float **audio, size_t *audio_elements,
+        float **anchor, size_t *anchor_elements,
         h3_layout_ref **references, size_t *reference_count,
         int *conditioned) {
     h3_text_embedding source = {
@@ -278,9 +303,11 @@ static int h3_conditioning_cache_load(
     if (!h3_text_embedding_copy(text, &source)) return 0;
     *video = NULL;
     *audio = NULL;
+    *anchor = NULL;
     *references = NULL;
     *video_elements = ctx->conditioning_video_elements;
     *audio_elements = ctx->conditioning_audio_elements;
+    *anchor_elements = ctx->conditioning_audio_anchor_elements;
     *reference_count = ctx->conditioning_reference_count;
     *conditioned = ctx->conditioning_present;
     if (*video_elements) {
@@ -293,16 +320,22 @@ static int h3_conditioning_cache_load(
         if (*audio) memcpy(*audio, ctx->conditioning_audio_rows,
                            *audio_elements * sizeof(**audio));
     }
+    if (*anchor_elements) {
+        *anchor = malloc(*anchor_elements * sizeof(**anchor));
+        if (*anchor) memcpy(*anchor, ctx->conditioning_audio_anchor,
+                            *anchor_elements * sizeof(**anchor));
+    }
     if (*reference_count) {
         *references = malloc(*reference_count * sizeof(**references));
         if (*references) memcpy(*references, ctx->conditioning_references,
                                 *reference_count * sizeof(**references));
     }
     if ((*video_elements && !*video) || (*audio_elements && !*audio) ||
+        (*anchor_elements && !*anchor) ||
         (*reference_count && !*references)) {
         h3_text_embedding_free(text);
-        free(*video); free(*audio); free(*references);
-        *video = NULL; *audio = NULL; *references = NULL;
+        free(*video); free(*audio); free(*anchor); free(*references);
+        *video = NULL; *audio = NULL; *anchor = NULL; *references = NULL;
         return 0;
     }
     return 1;
@@ -899,6 +932,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     /* H3_AUDIO_ANCHOR=1: keep the encoded reference audio as a [32,2,T]
        latent and hand it to the sampler as a known soundtrack. */
     float *audio_anchor = NULL;
+    size_t audio_anchor_elements = 0;
     /* 1 = the soundtrack rides its true noised trajectory; "clean" = the video
        sees the finished soundtrack from the first step. */
     int want_audio_anchor = getenv("H3_AUDIO_ANCHOR") &&
@@ -1004,9 +1038,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char detail[512];
     if (conditioning_hit) {
         size_t cached_reference_count = 0;
+        size_t cached_anchor_elements = 0;
         if (!h3_conditioning_cache_load(
                 ctx, &text, &condition_video_rows, &condition_video_elements,
                 &condition_audio_rows, &condition_audio_elements,
+                &audio_anchor, &cached_anchor_elements,
                 &layout_references, &cached_reference_count, &conditioned) ||
             cached_reference_count != (ref2va ? params->reference_count : 0)) {
             h3_set_error(ctx, "cannot restore cached conditioning");
@@ -1017,6 +1053,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (params->last_frame)
                 keyframes[keyframe_count++] = temporal.frame_count - 1;
         }
+        if (want_audio_anchor && audio_anchor)
+            audio_anchor_elements = cached_anchor_elements;
+        if (want_audio_anchor && audio_anchor)
+            fprintf(stderr, "h3: audio anchor restored from the conditioning "
+                    "cache (%zu latent elements)\n", cached_anchor_elements);
         fprintf(stderr, "h3: conditioning cache hit\n");
     } else {
     if (visual_capacity) {
@@ -1261,6 +1302,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                         (double)temporal.audio_t / H3_AUDIO_LATENT_FPS);
                     goto cleanup;
                 }
+                audio_anchor_elements = elements;
                 audio_anchor = malloc(elements * sizeof(*audio_anchor));
                 if (!audio_anchor) {
                     h3_audio_latent_free(&latent);
@@ -1382,17 +1424,99 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 goto cleanup;
             }
             if (video_init_sigma > 0.0f && image == 0 && !still_latent &&
-                image_latent_t == 1) {
-                size_t count = (size_t)24 * (size_t)image_latent_h *
-                               (size_t)image_latent_w;
+                image_latent_t == 1 &&
+                condition_widths[image] == render_width &&
+                condition_heights[image] == render_height) {
+                /* Encode the reference held for the whole clip.
+                
+                   Two wrong ways to build this, both measured.
+                
+                   Tiling the single-image latent is wrong: the temporal VAE
+                   gives latent frame 0 one image frame and every later one
+                   four, so a tiled latent is not a static video. Motion
+                   collapsed to 0.001 against 0.110 for a normal take and the
+                   mouth froze outright (aperture sd 0.0008).
+                
+                   Encoding one long held clip is also wrong, and it is the more
+                   interesting failure. h3_video_latent_t is ((f-5)/17)*5+2,
+                   not f/4: the DiT reads video latents in chunks of 5 tokens
+                   spanning 17 frames (1+4+4+4+4), after a head chunk of 2
+                   spanning 5 (1+4). The encoder downsamples time uniformly by
+                   4 and knows nothing about chunks, so 158 frames came back as
+                   40 latent frames where the DiT wanted 47 -- after 213 s and
+                   993 GiB of allocation. The encoder is only chunk-correct when
+                   its input is exactly one chunk.
+                
+                   So encode one chunk of each kind and lay them out. For a
+                   static clip every chunk of the same kind is identical, which
+                   makes the whole thing two small encodes instead of one huge
+                   wrong one. */
+                int groups = (temporal.frame_count - 5) / 17;
+                if (temporal.frame_count != 5 + 17 * groups) {
+                    fprintf(stderr,
+                        "h3: --frames %d is not 5+17k, cannot lay out a still "
+                        "clip; skipping the seed\n", temporal.frame_count);
+                } else {
+                size_t plane = (size_t)render_height * (size_t)render_width;
+                h3_video_latent head, body;
+                memset(&head, 0, sizeof(head));
+                memset(&body, 0, sizeof(body));
+                int ok_still = 1;
+                for (int which = 0; which < 2 && ok_still; which++) {
+                    int chunk = which ? 17 : 5;
+                    float *held = malloc((size_t)3 * plane * (size_t)chunk *
+                                         sizeof(*held));
+                    if (!held) { ok_still = 0; break; }
+                    for (int c = 0; c < 3; c++)
+                        for (int t = 0; t < chunk; t++)
+                            memcpy(held + ((size_t)c * (size_t)chunk +
+                                           (size_t)t) * plane,
+                                   condition_pixels[image] + (size_t)c * plane,
+                                   plane * sizeof(*held));
+                    ok_still = h3_video_vae_encode(
+                        vae_path, "h3_shaders.metal", held, chunk,
+                        render_height, render_width,
+                        h3_video_encoder_progress_bridge, &progress,
+                        which ? &body : &head, detail, sizeof(detail));
+                    free(held);
+                }
+                if (ok_still && (head.time != 2 || body.time != 5 ||
+                                 2 + 5 * groups != temporal.video_t ||
+                                 head.height != body.height ||
+                                 head.width != body.width)) ok_still = 0;
+                if (!ok_still) {
+                    h3_video_latent_free(&head);
+                    h3_video_latent_free(&body);
+                    h3_video_latent_free(&latent);
+                    h3_set_error(ctx, "cannot encode the held still chunks");
+                    goto cleanup;
+                }
+                still_lh = head.height; still_lw = head.width;
+                size_t sp = (size_t)still_lh * (size_t)still_lw;
+                size_t count = (size_t)24 * (size_t)temporal.video_t * sp;
                 still_latent = malloc(count * sizeof(*still_latent));
                 if (!still_latent) {
+                    h3_video_latent_free(&head);
+                    h3_video_latent_free(&body);
                     h3_video_latent_free(&latent);
                     h3_set_error(ctx, "out of memory keeping the still latent");
                     goto cleanup;
                 }
-                memcpy(still_latent, latent.values, count * sizeof(*still_latent));
-                still_lh = image_latent_h; still_lw = image_latent_w;
+                /* [24,T,H,W] channel-major, so the concatenation along T has to
+                   happen inside each channel, not as one run of blocks. */
+                for (int c = 0; c < 24; c++) {
+                    float *dst = still_latent + (size_t)c *
+                                 (size_t)temporal.video_t * sp;
+                    memcpy(dst, head.values + (size_t)c * 2 * sp,
+                           2 * sp * sizeof(*dst));
+                    for (int g = 0; g < groups; g++)
+                        memcpy(dst + (2 + (size_t)g * 5) * sp,
+                               body.values + (size_t)c * 5 * sp,
+                               5 * sp * sizeof(*dst));
+                }
+                h3_video_latent_free(&head);
+                h3_video_latent_free(&body);
+                }
             }
             h3_video_latent_free(&latent);
             condition_offset += row_elements;
@@ -1499,6 +1623,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 ctx, conditioning_key, &text,
                 condition_video_rows, condition_video_elements,
                 condition_audio_rows, condition_audio_elements,
+                audio_anchor, audio_anchor_elements,
                 layout_references, ref2va ? params->reference_count : 0,
                 conditioned))
             fprintf(stderr, "h3: warning: could not retain conditioning cache\n");
@@ -1644,8 +1769,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
     if (want_audio_anchor && !audio_anchor) {
-        h3_set_error(ctx, "H3_AUDIO_ANCHOR needs a --ref-audio clip encoded in "
-                          "this run (not a conditioning-cache hit)");
+        h3_set_error(ctx, "H3_AUDIO_ANCHOR needs a --ref-audio clip. If this "
+                          "is a conditioning-cache hit, the cached entry was "
+                          "stored by a run that had no anchor -- !cache clear "
+                          "and generate once more");
         goto cleanup;
     }
     h3_dit_set_audio_anchor(dit, audio_anchor);
@@ -1661,16 +1788,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         while (start + 1 < params->steps &&
                h3_dit_sigma_at(dit, start) > video_init_sigma) start++;
         float s0 = h3_dit_sigma_at(dit, start);
-        size_t plane = (size_t)latent_h * (size_t)latent_w;
-        for (int c = 0; c < 24; c++)
-            for (int t = 0; t < temporal.video_t; t++)
-                for (size_t i = 0; i < plane; i++) {
-                    size_t dst = ((size_t)c * (size_t)temporal.video_t +
-                                  (size_t)t) * plane + i;
-                    /* the still is one latent frame, held across the clip */
-                    float x0 = still_latent[(size_t)c * plane + i];
-                    video[dst] = (1.0f - s0) * x0 + s0 * video[dst];
-                }
+        size_t total = (size_t)24 * (size_t)temporal.video_t *
+                       (size_t)latent_h * (size_t)latent_w;
+        for (size_t i = 0; i < total; i++)
+            video[i] = (1.0f - s0) * still_latent[i] + s0 * video[i];
         /* The audio latent stays pure noise here; the sampler prepares its
            own blend at the start sigma, since it owns the anchor. */
         h3_dit_set_start_step(dit, start);

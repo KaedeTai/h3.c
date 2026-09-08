@@ -113,9 +113,28 @@ static h3_gpu_tensor *load_1d(load_context *load, const char *name,
                                             load->error_size));
 }
 
+static h3_gpu_tensor *allocate_bf16(load_context *load, size_t elements);
+static int read_weight_int4_group(const h3_weight_store *store,
+                                  const char *name, int ndim,
+                                  const uint64_t *shape,
+                                  h3_gpu_tensor *destination,
+                                  char *error, size_t error_size);
+
 static h3_gpu_tensor *load_2d(load_context *load, const char *name,
                               uint64_t rows, uint64_t columns) {
     uint64_t shape[] = {rows, columns};
+    /* There are two load paths -- this one and the prefetching lane reader --
+       and an int4 bundle has to be handled in both. A BF16 tensor can be mapped
+       straight out of the file; an int4 one has to be allocated first and
+       expanded into. */
+    if (!h3_weight_find(load->store, name, NULL)) {
+        h3_gpu_tensor *tensor = allocate_bf16(load, (size_t)(rows * columns));
+        if (!tensor) return NULL;
+        if (!read_weight_int4_group(load->store, name, 2, shape, tensor,
+                                    load->error, load->error_size))
+            return NULL;
+        return tensor;
+    }
     return defer(load, h3_weight_load_bf16(load->store, load->gpu, name, 2,
                                             shape, load->error,
                                             load->error_size));
@@ -212,16 +231,78 @@ static int layer_weights_allocate(load_context *load,
     return 1;
 }
 
+/* An int4 group-quantised projection, written by
+   tools/quantize_text_encoder_int4.py:
+
+     <name>.q4   U8  [rows, cols/2]    two weights a byte, low nibble first
+     <name>.q4s  F16 [rows, cols/g]    one absmax scale per g weights
+
+   The group size is not stored anywhere; it is implied, which is the point of
+   keeping both shapes: g = cols / scale_cols, and cols = 2 * packed_cols. The
+   original BF16 tensor is absent from the bundle, so this is reached by name
+   lookup failing rather than by a flag -- a bundle is int4 or it is not, and
+   mixing the two per tensor would be a way to ship a half-quantised checkpoint
+   without noticing. */
+static int read_weight_int4_group(const h3_weight_store *store,
+                                  const char *name, int ndim,
+                                  const uint64_t *shape,
+                                  h3_gpu_tensor *destination,
+                                  char *error, size_t error_size) {
+    char packed_name[224], scale_name[224];
+    if (ndim != 2 ||
+        (size_t)snprintf(packed_name, sizeof(packed_name), "%s.q4", name)
+            >= sizeof(packed_name) ||
+        (size_t)snprintf(scale_name, sizeof(scale_name), "%s.q4s", name)
+            >= sizeof(scale_name)) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    const h3_st_header *packed_header = NULL, *scale_header = NULL;
+    const h3_st_tensor *packed = h3_weight_find(store, packed_name,
+                                                &packed_header);
+    const h3_st_tensor *scale = h3_weight_find(store, scale_name,
+                                               &scale_header);
+    if (!packed || !scale) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    if (packed->dtype != H3_DTYPE_U8 || scale->dtype != H3_DTYPE_F16 ||
+        packed->ndim != 2 || scale->ndim != 2 ||
+        packed_header != scale_header) {
+        fail(error, error_size,
+             "int4 weight %s is malformed (want U8 + F16 in one shard)", name);
+        return 0;
+    }
+    uint64_t rows = shape[0], columns = shape[1];
+    if (packed->shape[0] != rows || packed->shape[1] * 2 != columns ||
+        scale->shape[0] != rows || !scale->shape[1] ||
+        columns % scale->shape[1]) {
+        fail(error, error_size, "int4 weight %s shape mismatch", name);
+        return 0;
+    }
+    uint64_t group = columns / scale->shape[1];
+    uint64_t elements = rows * columns;
+    if (elements > SIZE_MAX ||
+        !h3_gpu_tensor_read_file_int4_group(
+            destination, packed_header->path, packed->file_offset,
+            scale->file_offset, (size_t)elements, (size_t)group,
+            error, error_size)) {
+        if (error && error_size && !error[0])
+            fail(error, error_size, "cannot dequantise %s", name);
+        return 0;
+    }
+    return 1;
+}
+
 static int read_weight_bf16(const h3_weight_store *store, const char *name,
                             int ndim, const uint64_t *shape,
                             h3_gpu_tensor *destination,
                             char *error, size_t error_size) {
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
-    if (!tensor) {
-        fail(error, error_size, "required weight is absent: %s", name);
-        return 0;
-    }
+    if (!tensor)
+        return read_weight_int4_group(store, name, ndim, shape, destination,
+                                      error, error_size);
     if (tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != ndim) {
         fail(error, error_size,
              "weight %s has dtype/rank %s/%d, expected BF16/%d", name,

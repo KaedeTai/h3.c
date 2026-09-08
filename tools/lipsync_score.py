@@ -25,6 +25,21 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+
+_FPS_FLAG = None
+
+
+def _fps_mode_flag():
+    """ffmpeg 9 removed -vsync; older builds do not know -fps_mode."""
+    global _FPS_FLAG
+    if _FPS_FLAG is None:
+        probe = subprocess.run(["ffmpeg", "-hide_banner", "-h", "full"],
+                               capture_output=True, text=True)
+        _FPS_FLAG = (["-fps_mode", "passthrough"]
+                     if "-fps_mode" in probe.stdout else ["-vsync", "0"])
+    return _FPS_FLAG
+
+
 FPS = 24.0
 # inner lip contour: upper and lower midpoints, and the two corners
 UPPER, LOWER, LEFT, RIGHT = 13, 14, 78, 308
@@ -44,10 +59,43 @@ def _landmarker():
             running_mode=mp_vision.RunningMode.IMAGE, num_faces=1))
 
 
+def head_track(mp4):
+    """Face centroid and face width per frame, in pixels.
+
+    Whole-frame |delta| between consecutive frames -- `scene` in take_report --
+    is not a head-motion measure: it mixes the head with the background and its
+    size depends on how much of the frame the head fills. This does not. The
+    centroid is the mean of all 478 landmarks and the width is their bounding
+    box, so displacement expressed in face-widths is invariant to both framing
+    and canvas.
+
+    Returns (centroids [T,2], widths [T]) with NaN where no face was found.
+    """
+    d = tempfile.mkdtemp()
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp4,
+                    *_fps_mode_flag(), f"{d}/f_%05d.png"], check=True)
+    mesh = _landmarker()
+    centroids, widths = [], []
+    for fn in sorted(os.listdir(d)):
+        img = cv2.cvtColor(cv2.imread(f"{d}/{fn}"), cv2.COLOR_BGR2RGB)
+        res = mesh.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=img))
+        os.unlink(f"{d}/{fn}")
+        if not res.face_landmarks:
+            centroids.append((np.nan, np.nan)); widths.append(np.nan); continue
+        lm = res.face_landmarks[0]
+        h, w = img.shape[:2]
+        xs = np.array([p.x for p in lm]) * w
+        ys = np.array([p.y for p in lm]) * h
+        centroids.append((xs.mean(), ys.mean()))
+        widths.append(xs.max() - xs.min())
+    shutil.rmtree(d, ignore_errors=True)
+    return np.array(centroids), np.array(widths)
+
+
 def mouth_curve(mp4):
     d = tempfile.mkdtemp()
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp4, "-vsync", "0",
-                    f"{d}/f_%05d.png"], check=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", mp4,
+                    *_fps_mode_flag(), f"{d}/f_%05d.png"], check=True)
     mesh = _landmarker()
     vals = []
     for fn in sorted(os.listdir(d)):

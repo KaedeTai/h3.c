@@ -67,6 +67,18 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size);
+/* Fill an existing shared BF16 buffer from an int4 group-quantised pair: a
+ * packed U8 payload (two weights a byte, low nibble first, stored as q+8) and
+ * an F16 absmax scale per `group` weights along the input dimension. The
+ * dequantisation happens on the CPU into the shared buffer, which on this
+ * hardware is the same memory the GPU will read -- there is no copy to make and
+ * no kernel to dispatch. Sixteen products per group are all the distinct values
+ * a group can take, so the inner loop is two table lookups a byte. */
+int h3_gpu_tensor_read_file_int4_group(h3_gpu_tensor *tensor, const char *path,
+                                       uint64_t packed_offset,
+                                       uint64_t scale_offset,
+                                       size_t elements, size_t group,
+                                       char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);

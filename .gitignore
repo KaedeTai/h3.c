@@ -3,6 +3,8 @@ misc/
 MiniMax-H3/
 MiniMax-H3-turbo/
 MiniMax-H3-turbo-int8/
+MiniMax-H3-slim/
+text_encoder_int4/
 outputs/
 .ruff_cache/
 
@@ -15,6 +17,7 @@ h3
 h3_*test
 h3_*tests
 h3_*bench
+h3_v
 h3_dit_bench_864
 h3_tests
 h3_metal_tests

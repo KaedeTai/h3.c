@@ -181,6 +181,11 @@ const h3_model_info *h3_model(const h3_ctx *ctx);
  * the original phase-by-phase memory lifetime. */
 void h3_cache_set_enabled(h3_ctx *ctx, int enabled);
 void h3_cache_clear(h3_ctx *ctx);
+/* Drop only what depends on the prompt and the references, keeping the prepared
+ * DiT and the video decoder resident. Changing a reference between generations
+ * -- which is what a segmented long-form render does every segment -- has no
+ * bearing on either of those, and throwing them away costs ~8 s a segment. */
+void h3_cache_clear_conditioning(h3_ctx *ctx);
 void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 
 /* Generate media, delivering decoded frames incrementally through on_frame. */

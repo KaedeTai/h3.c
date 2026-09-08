@@ -24,6 +24,11 @@ struct h3_ctx {
     size_t conditioning_video_elements;
     float *conditioning_audio_rows;
     size_t conditioning_audio_elements;
+    /* The [32,2,T] encoder output the audio anchor writes into the target rows.
+       Distinct from conditioning_audio_rows, which is the patchified REF_AUDIO
+       segment. Kept so a conditioning-cache hit can still anchor. */
+    float *conditioning_audio_anchor;
+    size_t conditioning_audio_anchor_elements;
     h3_layout_ref *conditioning_references;
     size_t conditioning_reference_count;
     int conditioning_present;
