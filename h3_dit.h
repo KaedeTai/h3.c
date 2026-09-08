@@ -79,6 +79,19 @@ void h3_dit_free(h3_dit *dit);
 
 /* Reset mutable sampler state and replace seed-dependent condition rows before
  * reusing an otherwise identical prepared transformer. */
+/* Re-point a prepared DiT at a new prompt and layout, keeping the block
+ * weights and the AdaLN schedule. Refuses if the new layout changes whether
+ * there is a visual or audio condition, because the schedule is precomputed
+ * for that answer. */
+int h3_dit_rebind(h3_dit *dit,
+                  const h3_text_embedding *text,
+                  const h3_layout *layout,
+                  const float *condition_video_rows,
+                  size_t condition_video_elements,
+                  const float *condition_audio_rows,
+                  size_t condition_audio_elements,
+                  char *error, size_t error_size);
+
 int h3_dit_reset_run(h3_dit *dit,
                      const float *condition_video_rows,
                      size_t condition_video_elements,

@@ -63,6 +63,8 @@ void h3_cache_clear(h3_ctx *ctx) {
     ctx->dit = NULL;
     free(ctx->dit_key);
     ctx->dit_key = NULL;
+    free(ctx->dit_model_key);
+    ctx->dit_model_key = NULL;
     h3_video_vae_decoder_free(ctx->video_decoder);
     ctx->video_decoder = NULL;
     free(ctx->video_decoder_key);
@@ -165,6 +167,54 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
 failed:
     free(key.text);
     return NULL;
+}
+
+/* The prompt-independent half of the prepared DiT: the block weights and the
+   AdaLN schedule. AdaLN is precomputed from the sigmas and two booleans -- is
+   there a visual condition, is there an audio condition -- and never sees the
+   text, so a new prompt only invalidates the layout-sized state. Shape stays in
+   this key only as far as it changes behaviour: the render size sets the RoPE
+   scale, and the int8 attention paths are selected on whether the sequence
+   clears 128 rows -- but the frame count itself does not belong here, because
+   every buffer sized by it is rebuilt on rebind. That is what lets long-form
+   segments of different legal lengths reuse one prepared DiT. The sigmas are
+   spelled out because H3_SIGMA_BASE can change them without changing --steps. */
+static char *h3_model_key(const char *dit_path, const h3_params *params,
+                          int render_width, int render_height, int ref2va,
+                          int visual_condition, int audio_condition,
+                          int long_sequence,
+                          const h3_sigma_schedule *sigmas) {
+    h3_key key = {0};
+    if (!h3_key_append(
+            &key,
+            "%s|mode=%d|cond=%d%d|render=%dx%d|seq128=%d|steps=%d|layers=%d"
+            "|reuse-core=%d|reduce=%d|row-fc2=%d|reference-rope=%d"
+            "|ssd-streaming=%d|slow=%d%d%d%d%d%d%d%d%d%d",
+            dit_path, ref2va, visual_condition, audio_condition,
+            render_width, render_height, long_sequence,
+            params->steps, params->dit_layers, params->core_reuse,
+            params->token_reduction, params->use_int8_row_fc2,
+            params->use_reference_rope, params->ssd_streaming,
+            params->use_slower_bf16_mlp, params->use_slower_bf16_qkv,
+            params->use_slower_bf16_attention_output,
+            params->use_slower_row_major_attention_output,
+            params->use_slower_unfused_int8_inputs,
+            params->use_slower_unfused_qkv_rope,
+            params->use_slower_scalar_qkv_rms,
+            params->use_slower_uncached_int8_scales,
+            params->use_slower_dynamic_fc1_k,
+            params->use_slower_grouped_quantizer)) {
+        free(key.text);
+        return NULL;
+    }
+    for (int step = 0; step <= sigmas->steps; step++) {
+        if (!h3_key_append(&key, "|s%d=%.6f,%.6f", step,
+                           sigmas->video[step], sigmas->audio[step])) {
+            free(key.text);
+            return NULL;
+        }
+    }
+    return key.text;
 }
 
 static char *h3_prepared_key(const char *conditioning,
@@ -967,6 +1017,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_result *result = NULL;
     char *conditioning_key = NULL;
     char *prepared_key = NULL;
+    char *model_key = NULL;
     char *decoder_key = NULL;
     int conditioning_hit = 0;
     int conditioned = 0;
@@ -1035,13 +1086,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         free(ctx->video_decoder_key);
         ctx->video_decoder_key = NULL;
     }
-    if (ctx->cache_enabled && ctx->dit &&
-        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
-        h3_dit_free(ctx->dit);
-        ctx->dit = NULL;
-        free(ctx->dit_key);
-        ctx->dit_key = NULL;
-    }
+    /* Deliberately NOT evicted on a prompt change. A cached DiT whose MODEL key
+       still matches is rebound further down instead of reloaded, which saves
+       the transformer core and the AdaLN precompute -- about 10 s of a 39 s
+       run. Eviction happens against the model key, once the sigmas are known. */
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
     char detail[512];
@@ -1665,6 +1713,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     float spatial_rope_scale = !params->use_reference_rope &&
         render_width == 256 && render_height == 256 ? 0.5f : 1.0f;
+    model_key = h3_model_key(
+        dit_path, params, render_width, render_height, ref2va,
+        condition_video_rows != NULL, condition_audio_rows != NULL,
+        layout.seq_len >= 128, &sigmas);
+    if (!model_key) {
+        h3_set_error(ctx, "out of memory constructing DiT model cache key");
+        goto cleanup;
+    }
+    /* A cached DiT is only useless once the MODEL key differs. */
+    if (ctx->cache_enabled && ctx->dit &&
+        (!ctx->dit_model_key || strcmp(ctx->dit_model_key, model_key))) {
+        h3_dit_free(ctx->dit);
+        ctx->dit = NULL;
+        free(ctx->dit_key); ctx->dit_key = NULL;
+        free(ctx->dit_model_key); ctx->dit_model_key = NULL;
+    }
+    if (ctx->cache_enabled && ctx->dit && getenv("H3_NO_REBIND") &&
+        (!ctx->dit_key || strcmp(ctx->dit_key, prepared_key))) {
+        h3_dit_free(ctx->dit);
+        ctx->dit = NULL;
+        free(ctx->dit_key); ctx->dit_key = NULL;
+        free(ctx->dit_model_key); ctx->dit_model_key = NULL;
+    }
     if (ctx->cache_enabled && ctx->dit && ctx->dit_key &&
         !strcmp(ctx->dit_key, prepared_key)) {
         dit = ctx->dit;
@@ -1677,7 +1748,32 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
-    } else if (conditioned) {
+    } else if (ctx->cache_enabled && ctx->dit && !getenv("H3_NO_REBIND")) {
+        /* Same weights, same AdaLN, different prompt: rebind rather than
+           reload. If the layout turns out to change the conditioning shape,
+           h3_dit_rebind refuses and the DiT is dropped for a full load. */
+        if (h3_dit_rebind(ctx->dit, &text, &layout,
+                          condition_video_rows, condition_video_elements,
+                          condition_audio_rows, condition_audio_elements,
+                          detail, sizeof(detail))) {
+            dit = ctx->dit;
+            dit_is_cached = 1;
+            free(ctx->dit_key);
+            ctx->dit_key = strdup(prepared_key);
+            if (!ctx->dit_key) {
+                fprintf(stderr, "h3: warning: could not retain prepared DiT "
+                                "key after rebind\n");
+            }
+            fprintf(stderr, "h3: prepared DiT rebound to a new prompt\n");
+        } else {
+            fprintf(stderr, "h3: DiT rebind declined (%s); reloading\n", detail);
+            h3_dit_free(ctx->dit);
+            ctx->dit = NULL;
+            free(ctx->dit_key); ctx->dit_key = NULL;
+            free(ctx->dit_model_key); ctx->dit_model_key = NULL;
+        }
+    }
+    if (!dit && conditioned) {
         if (dit_t2va) {
             /* Checked here rather than at variant selection: `conditioned` is
                only known once the references have been encoded. */
@@ -1705,7 +1801,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
-    } else {
+    }
+    if (!dit && !conditioned) {
         dit = h3_dit_load_t2va(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
@@ -1731,11 +1828,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (ctx->cache_enabled && !dit_is_cached) {
         char *key_copy = strdup(prepared_key);
-        if (!key_copy) {
+        char *model_copy = strdup(model_key);
+        if (!key_copy || !model_copy) {
+            free(key_copy); free(model_copy);
             fprintf(stderr, "h3: warning: could not retain prepared DiT key\n");
         } else {
             ctx->dit = dit;
             ctx->dit_key = key_copy;
+            free(ctx->dit_model_key);
+            ctx->dit_model_key = model_copy;
             dit_is_cached = 1;
             fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
         }
@@ -1934,6 +2035,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
 cleanup:
     free(conditioning_key);
     free(prepared_key);
+    free(model_key);
     free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);

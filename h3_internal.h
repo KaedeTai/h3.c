@@ -33,6 +33,7 @@ struct h3_ctx {
     size_t conditioning_reference_count;
     int conditioning_present;
     char *dit_key;
+    char *dit_model_key;
     struct h3_dit *dit;
     char *video_decoder_key;
     struct h3_video_vae_decoder *video_decoder;

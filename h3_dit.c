@@ -3127,6 +3127,122 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
         progress, progress_opaque, NULL, NULL, error, error_size);
 }
 
+/* Everything in the prepared DiT that a new prompt invalidates, and nothing
+   else. The block weights, their int8 quantization and the AdaLN schedule all
+   survive -- h3_dit_schedule_precompute takes weights, gpu and sigmas and no
+   text at all, so the modulation is purely timestep-driven, and the weights
+   obviously do not care what was said. What a different prompt does change is
+   the token count, and with it the sequence length and every buffer sized by
+   it: RoPE tables, row maps, activations, the packed condition rows. */
+static void release_run_state(h3_dit *dit) {
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    if (dit->row_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->row_maps[step]);
+    if (dit->reduced_row_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->reduced_row_maps[step]);
+    if (dit->final_audio_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->final_audio_maps[step]);
+    if (dit->final_video_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->final_video_maps[step]);
+    free(dit->row_maps); dit->row_maps = NULL;
+    free(dit->reduced_row_maps); dit->reduced_row_maps = NULL;
+    free(dit->final_audio_maps); dit->final_audio_maps = NULL;
+    free(dit->final_video_maps); dit->final_video_maps = NULL;
+    free_tensor(&dit->refined_text);
+    free_tensor(&dit->rope_cos);
+    free_tensor(&dit->rope_sin);
+    free_tensor(&dit->reduced_rope_cos);
+    free_tensor(&dit->reduced_rope_sin);
+#define FREE(field) free_tensor(&dit->field)
+    if (dit->activation_aliases) {
+        dit->attention_heads = NULL;
+        dit->mod_mlp = NULL;
+    }
+    FREE(video_input); FREE(audio_input);
+    FREE(video_projected_f32); FREE(audio_projected_f32);
+    FREE(video_projected); FREE(audio_projected);
+    FREE(video_projection_map); FREE(audio_projection_map); FREE(hidden);
+    FREE(core_input); FREE(core_residual);
+    FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
+    FREE(attention_heads); FREE(attention_output);
+    FREE(token_pool_pairs); FREE(token_baseline_indices);
+    FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
+    FREE(activated); FREE(mlp_output); FREE(int8_activation);
+    FREE(int8_activation_scales); FREE(final_audio_input);
+    FREE(final_video_input); FREE(final_audio_inverse);
+    FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
+    FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);
+    FREE(video_output);
+    FREE(audio_output_bf16); FREE(video_output_bf16);
+    FREE(previous_audio_velocity); FREE(previous_video_velocity);
+#undef FREE
+    dit->activation_aliases = 0;
+    dit->core_forward_count = 0;
+    dit->core_residual_ready = 0;
+    dit->audio_anchor = NULL;
+    dit->start_step = 0;
+    h3_layout_free(&dit->layout);
+    memset(&dit->layout, 0, sizeof(dit->layout));
+}
+
+int h3_dit_rebind(h3_dit *dit,
+                  const h3_text_embedding *text,
+                  const h3_layout *layout,
+                  const float *condition_video_rows,
+                  size_t condition_video_elements,
+                  const float *condition_audio_rows,
+                  size_t condition_audio_elements,
+                  char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!dit || !text || !layout) {
+        fail(error, error_size, "invalid DiT rebind arguments");
+        return 0;
+    }
+    /* The AdaLN schedule is precomputed for a fixed answer to "is there a
+       visual condition, is there an audio condition". A layout that changes
+       either answer needs a different schedule, so refuse and let the caller
+       fall back to a full load rather than silently modulate against the wrong
+       table. */
+    int had_video_condition = dit->video_condition_rows != 0;
+    int had_audio_condition = dit->audio_condition_rows != 0;
+    int token_reduction = dit->token_reduction;
+    release_run_state(dit);
+    if (!copy_layout(dit, layout, error, error_size) ||
+        !validate_layout(dit, text, error, error_size) ||
+        !configure_token_reduction(dit, token_reduction, error, error_size))
+        return 0;
+    if ((dit->video_condition_rows != 0) != had_video_condition ||
+        (dit->audio_condition_rows != 0) != had_audio_condition) {
+        fail(error, error_size,
+             "rebind changes the conditioning shape; reload the DiT");
+        return 0;
+    }
+    size_t wanted_video = (size_t)dit->video_condition_rows * VIDEO_PATCH;
+    size_t wanted_audio = (size_t)dit->audio_condition_rows * AUDIO_CHANNELS;
+    if (condition_video_elements != wanted_video ||
+        condition_audio_elements != wanted_audio ||
+        (wanted_video && !condition_video_rows) ||
+        (wanted_audio && !condition_audio_rows)) {
+        fail(error, error_size,
+             "condition row elements do not match the rebound DiT layout");
+        return 0;
+    }
+    if (!refine_text(dit, text, error, error_size) ||
+        !prepare_rope(dit, error, error_size) ||
+        !prepare_maps(dit, text, error, error_size) ||
+        !prepare_projection_maps(dit, error, error_size) ||
+        !prepare_token_reduction_maps(dit, error, error_size) ||
+        !allocate_activations(dit, error, error_size)) return 0;
+    if ((wanted_video && !h3_gpu_tensor_write_f32_range(
+             dit->video_input, 0, condition_video_rows, wanted_video)) ||
+        (wanted_audio && !h3_gpu_tensor_write_f32_range(
+             dit->audio_input, 0, condition_audio_rows, wanted_audio))) {
+        fail(error, error_size, "cannot write rebound DiT condition rows");
+        return 0;
+    }
+    return 1;
+}
+
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
     int steps = h3_dit_schedule_steps(dit->schedule);

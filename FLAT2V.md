@@ -478,6 +478,52 @@ Never parse h3's stdout. It is block-buffered through a pipe, so a finished
 segment sits on disk while the driver waits forever. `flat2v_long.py` polls the
 filesystem.
 
+## Rebinding the prepared DiT to a new prompt
+
+The prepared DiT used to be keyed on the prompt, so every new prompt paid the
+transformer core and the AdaLN precompute again — about 10 s of a 39 s run, for
+weights that had not changed. They do not need to.
+
+`h3_dit_schedule_precompute` takes weights, gpu and sigmas and **no text at
+all**: the modulation is purely timestep-driven. The block weights obviously do
+not care what was said either. What a new prompt really changes is the token
+count, and with it the sequence length and every buffer sized by it — RoPE
+tables, row maps, activations, the packed condition rows.
+
+So the cache is now keyed twice. `h3_model_key` covers what a prompt cannot
+touch — weight path, sigmas spelled out in full (because `H3_SIGMA_BASE` can
+change them without changing `--steps`), render size, the int8 and slow flags,
+and whether the sequence clears 128 rows, which is what selects the int8
+attention paths. `h3_dit_rebind` then releases only the layout-sized state and
+rebuilds it. The frame count is deliberately **not** in the model key: every
+buffer sized by it is rebuilt anyway, and leaving it out is what lets long-form
+segments of different legal lengths share one prepared DiT.
+
+Rebind refuses, and the caller falls back to a full load, if the new layout
+changes whether there is a visual or an audio condition — the AdaLN schedule is
+precomputed for that answer.
+
+| | before | after |
+|---|---|---|
+| T2VA, four different prompts, resident | 38.2–40.7 s | **34.1–35.5 s** |
+| long form, 4 segments of 3 legal lengths | 216.7 s | **197.5 s** |
+
+**Correctness.** T2VA is byte-deterministic, so the proof there is exact: three
+prompts rebound onto one prepared DiT produced output with **the same md5** as
+three separate full loads, 4/4. The FL2VA path is not byte-deterministic — the
+same command twice differs even with rebind disabled and no rebind in play — so
+it was graded instead, three replicates each way behind an `H3_NO_REBIND`
+kill-switch:
+
+| | n | mean aperture | s.d. |
+|---|---|---|---|
+| rebind off | 3 | 0.1012 | 0.0031 |
+| rebind on | 3 | 0.0989 | 0.0021 |
+
+Between modes 0.0023, within a mode 0.0026. A single sample each had put the gap
+at 0.0066, right on the noise line and looking like a real regression; it was
+not, and one replicate would not have told the difference.
+
 ## T2VA: the third checkpoint
 
 MiniMax publish three transformers, not two. `FL2VA/` and `Ref2VA/` sit beside a
