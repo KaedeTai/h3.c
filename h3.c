@@ -982,15 +982,24 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
        that, to ask whether the FL2VA weights understand a REF_AUDIO segment
        they were never trained on, or whether the segment vocabulary really is
        split between the two checkpoints. */
+    /* T2VA is the third checkpoint MiniMax publish: the base text-to-
+       audio-video transformer, and the parent of every FastVideo distillation.
+       It shares this bundle's tokenizer, text encoder and VAEs like the other
+       two, so it is another DiT weight set and nothing more -- the prompt-only
+       code path it needs is the one h3_dit_load_t2va already serves. It ships
+       in the diffusers naming; tools/convert_diffusers_dit.py rewrites it into
+       the layout this loader reads. */
     const char *dit_variant = getenv("H3_DIT_VARIANT");
     int dit_ref2va = ref2va;
+    int dit_t2va = 0;
     if (dit_variant && !strcmp(dit_variant, "FL2VA")) dit_ref2va = 0;
     else if (dit_variant && !strcmp(dit_variant, "Ref2VA")) dit_ref2va = 1;
-    if (dit_variant && dit_ref2va != ref2va)
+    else if (dit_variant && !strcmp(dit_variant, "T2VA")) dit_t2va = 1;
+    if (dit_variant && !dit_t2va && dit_ref2va != ref2va)
         fprintf(stderr, "h3: DiT weights forced to %s against a %s layout\n",
                 dit_ref2va ? "Ref2VA" : "FL2VA", ref2va ? "Ref2VA" : "FL2VA");
-    char *dit_path = h3_path(ctx->model_dir, dit_ref2va ?
-        "Ref2VA/transformer" : "FL2VA/transformer");
+    char *dit_path = h3_path(ctx->model_dir, dit_t2va ? "T2VA/transformer" :
+        dit_ref2va ? "Ref2VA/transformer" : "FL2VA/transformer");
     char *vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
     char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
@@ -1669,6 +1678,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
     } else if (conditioned) {
+        if (dit_t2va) {
+            /* Checked here rather than at variant selection: `conditioned` is
+               only known once the references have been encoded. */
+            h3_set_error(ctx, "T2VA was trained without reference segments: "
+                              "drop --ref-image and --ref-audio, or use FL2VA");
+            goto cleanup;
+        }
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,

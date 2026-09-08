@@ -147,13 +147,56 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+/* The released grid is linear in the base clock: base = 1 - index/steps, then
+   shifted per modality. Distilled checkpoints are trained to be entered at
+   specific points on that base clock instead -- FastVideo's FastH3 uses
+   999/749/500/250 out of 1000 with four forwards -- so H3_SIGMA_BASE takes a
+   comma-separated list of base sigmas in (0,1], descending, and replaces the
+   linear grid. The per-modality shift still applies: it is a property of the
+   architecture, not of the schedule, and the distilled timesteps are quoted on
+   the same unshifted clock the linear grid is built from. The terminal zero is
+   appended, so the list is exactly the model forwards. */
+static int h3_parse_sigma_base(const char *spec, float *base, int limit) {
+    int count = 0;
+    while (*spec && count < limit) {
+        char *end = NULL;
+        float value = strtof(spec, &end);
+        if (end == spec) return -1;
+        if (!(value > 0.0f) || value > 1.0f) return -1;
+        if (count && value >= base[count - 1]) return -1;
+        base[count++] = value;
+        spec = end;
+        while (*spec == ',' || *spec == ' ') spec++;
+    }
+    return *spec ? -1 : count;
+}
+
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
-    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+    if (!schedule) return 0;
+    float base_grid[H3_MAX_STEPS + 1];
+    const char *spec = getenv("H3_SIGMA_BASE");
+    int custom = 0;
+    if (spec && *spec) {
+        custom = h3_parse_sigma_base(spec, base_grid, H3_MAX_STEPS);
+        if (custom < 2) {
+            fprintf(stderr, "h3: H3_SIGMA_BASE must list at least two "
+                            "descending sigmas in (0,1]\n");
+            return 0;
+        }
+        if (evaluations != custom) {
+            fprintf(stderr, "h3: H3_SIGMA_BASE overrides --steps %d with its "
+                            "own %d forwards\n", evaluations, custom);
+        }
+        evaluations = custom;
+    }
+    if (evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
     memset(schedule, 0, sizeof(*schedule));
     schedule->steps = evaluations;
     float denominator = (float)evaluations;
     for (int index = 0; index <= evaluations; index++) {
-        float base = 1.0f - (float)index / denominator;
+        float base = custom ?
+            (index < custom ? base_grid[index] : 0.0f) :
+            1.0f - (float)index / denominator;
         schedule->video[index] = (float)H3_VIDEO_SIGMA_SHIFT * base /
             (1.0f + ((float)H3_VIDEO_SIGMA_SHIFT - 1.0f) * base);
         schedule->audio[index] = (float)H3_AUDIO_SIGMA_SHIFT * base /
@@ -161,6 +204,13 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     }
     schedule->video[evaluations] = 0.0f;
     schedule->audio[evaluations] = 0.0f;
+    if (custom) {
+        fprintf(stderr, "h3: sigma schedule (%d forwards)\n", evaluations);
+        for (int index = 0; index <= evaluations; index++)
+            fprintf(stderr, "h3:   base %.5f -> video %.5f  audio %.5f\n",
+                    index < custom ? base_grid[index] : 0.0f,
+                    schedule->video[index], schedule->audio[index]);
+    }
     return 1;
 }
 

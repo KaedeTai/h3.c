@@ -477,3 +477,101 @@ a VAE round trip of it.
 Never parse h3's stdout. It is block-buffered through a pipe, so a finished
 segment sits on disk while the driver waits forever. `flat2v_long.py` polls the
 filesystem.
+
+## T2VA: the third checkpoint
+
+MiniMax publish three transformers, not two. `FL2VA/` and `Ref2VA/` sit beside a
+plain `transformer/` at the repo root: the base **text-to-audio-video** model,
+and the parent of every FastVideo distillation. h3.c needed no new code path for
+it — `h3_dit_load_t2va` already serves prompt-only runs, `h3_audio_vae_decode`
+already runs, and the waveform is already muxed. It is a third DiT weight set on
+machinery that was there.
+
+```sh
+H3_DIT_VARIANT=T2VA \
+H3_SIGMA_BASE=0.988131,0.199149,0.027027 \
+H3_VAE_INT8_FFN=1 \
+./h3 -d ./MiniMax-H3-turbo-int8 -p "<scene description>" \
+  --width 384 --height 512 --frames 158 --steps 3 \
+  --use-int8-row-fc2 -o out.mp4
+```
+
+**38–41 s** for 6.6 s of 384×512 video *and its soundtrack*, from nothing but a
+sentence. The bundle shares its tokenizer, text encoder and VAEs with the other
+two — FastVideo's text encoder is byte-identical to MiniMax's, 1058 tensors and
+the same 66,714,780,128 bytes, so the int4 one already on disk serves all three.
+
+### Converting the diffusers layout
+
+`tools/convert_diffusers_dit.py`. The base transformer and everything distilled
+from it ship in the diffusers port — `transformer_blocks.N`, separate
+`to_q`/`to_k`/`to_v`, `ff.net.0.proj` — while h3.c reads MiniMax's own spelling.
+Same architecture, same shapes, different names, and **two things that are not
+just names**:
+
+| | |
+|---|---|
+| **fused QKV is per-head interleaved** | row block `h*384 … h*384+384` is head *h*'s q, then k, then v — not `[all_q; all_k; all_v]` |
+| **the SwiGLU halves of `fc1` are swapped** | `ff.net.0.proj`'s top half is `mlp.fc1`'s bottom half |
+
+Both were found without generating a single frame, and that is the point.
+MiniMax ship the *same* Ref2VA weights twice — `transformer_ref/` in diffusers
+naming, `Ref2VA/transformer/` natively — so the two spellings can be diffed
+against each other tensor by tensor over HTTP range requests, a few hundred rows
+at a time, with no 70 GB download. Twenty tensors matched byte-for-byte; two did
+not, and those two were the bugs.
+
+The dtype table is read from a real native bundle rather than hardcoded: the
+loader is strict, and wants F32 for the patch projections, the time embedder and
+the output heads where diffusers stores everything BF16. `rope.inv_freq` is
+stored natively and computed in diffusers, so it is copied across.
+
+**Why this had to be checked against weights and not against output.** With the
+QKV wrong and `fc1` right, the video was pure colour static — obvious. With both
+wrong, the video *still looked like a scene* and only the audio was visibly
+broken. Residual paths keep producing something structured no matter how badly
+q, k and v are scrambled, so "the picture looks plausible" is not evidence that
+the weights are right.
+
+### The distilled schedule
+
+`H3_SIGMA_BASE` takes a descending list of base sigmas and replaces h3's linear
+grid, keeping the per-modality shift (12.0 video, 3.0 audio — the two
+`scheduler_config.json` files confirm both). FastVideo quote their DMD steps as
+**999/749/500/250**, and those are *shifted video-clock* values: inverted through
+the video shift they give the base list above. Read as base sigmas instead, the
+last video step falls from 0.80 straight to 0, and the audio from 0.50 — the
+audio never converges.
+
+### Measured
+
+| | time | notes |
+|---|---|---|
+| bf16, 4 forwards | 61.1 s | |
+| int8, 4 forwards | **44.1 s** | byte-identical output, same md5 |
+| int8, 3 forwards | **38–41 s** | no visible difference |
+| int8, 2 forwards | 34.4 s | visibly soft; rejected |
+
+`tools/quantize_h3_int8.py` is a pure load-time win here: h3.c quantises those
+four projections at load anyway, so pre-quantising produces the *same bytes* out
+and only skips the work. 66.3 GB → 47.0 GB on disk.
+
+Where a 3-forward run goes: **denoise 34%, video VAE load 26%, transformer core
+17%, text encoder 10%, AdaLN precompute 10%.** Only a third is the model. In a
+resident process the video VAE and the prepared DiT both cache — the same prompt
+again costs 30 s instead of 39 — but the prepared DiT is keyed on the prompt, so
+a *new* prompt pays the 10 s of transformer core and AdaLN again.
+
+That 10 s is recoverable in principle: `h3_dit_schedule_precompute` takes
+weights, gpu and sigmas and **no text at all**, so the AdaLN schedule is purely
+timestep-driven. What blocks it is the layout — text rows are the real token
+count, so a different-length prompt changes the sequence length and every
+RoPE-sized buffer with it.
+
+### VSA
+
+The checkpoint FastVideo recommend carries an extra `attn.to_gate_compress`
+[7168, 5376] per block — 50 tensors that only their sparse-attention kernel
+consumes, and that neither base H3 nor the dense variant has. The converter
+drops them with a count. Use `…-Dense-DataFree` instead: 638 tensors, the same
+set as the base, `requires_vsa: false`.
