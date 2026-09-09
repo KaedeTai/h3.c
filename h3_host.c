@@ -204,6 +204,18 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     }
     schedule->video[evaluations] = 0.0f;
     schedule->audio[evaluations] = 0.0f;
+    /* H3_AUDIO_SIGMA_ZERO pins the audio clock at zero for every step. With
+       H3_AUDIO_ANCHOR the target audio rows are already replaced by the
+       reference on its trajectory, and at sigma 0 that trajectory IS the clean
+       reference -- so this hands the picture the finished soundtrack the way
+       H3_AUDIO_ANCHOR=clean does, but with the AdaLN modulation agreeing that
+       the audio is clean instead of being told it is noised to the step's
+       sigma. The overwrite happens behind the model's back either way; this
+       only stops lying to it about what it is looking at. */
+    if (getenv("H3_AUDIO_SIGMA_ZERO")) {
+        for (int index = 0; index <= evaluations; index++)
+            schedule->audio[index] = 0.0f;
+    }
     if (custom) {
         fprintf(stderr, "h3: sigma schedule (%d forwards)\n", evaluations);
         for (int index = 0; index <= evaluations; index++)

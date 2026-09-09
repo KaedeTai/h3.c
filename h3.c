@@ -1775,11 +1775,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (!dit && conditioned) {
         if (dit_t2va) {
-            /* Checked here rather than at variant selection: `conditioned` is
-               only known once the references have been encoded. */
-            h3_set_error(ctx, "T2VA was trained without reference segments: "
-                              "drop --ref-image and --ref-audio, or use FL2VA");
-            goto cleanup;
+            /* T2VA was trained prompt-only, so a reference segment is as
+               off-distribution for it as REF_AUDIO is for FL2VA -- which works.
+               The three checkpoints share one conditioning grammar, so this is
+               a question to answer by measuring, not by refusing. */
+            fprintf(stderr, "h3: T2VA weights against a conditioned layout; "
+                            "it was never trained on reference segments\n");
         }
         dit = h3_dit_load_conditioned(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,

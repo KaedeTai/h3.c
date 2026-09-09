@@ -31,7 +31,7 @@ the first in one resident process, against 417 s unaccelerated.
 
 | | |
 |---|---|
-| `H3_DIT_VARIANT=FL2VA` | FL2VA's weights were never trained on a `REF_AUDIO` segment but parse one anyway — the two checkpoints share one conditioning grammar. FL2VA carries a frame anchor through a whole clip where Ref2VA drops it by frame 2, and it has the stronger turbo LoRA (v1.1 768p vs v0.1). |
+| `H3_DIT_VARIANT=FL2VA` | FL2VA and the base text-to-audio-video transformer are **the same weights** — see below — so this network already generates a soundtrack; a `REF_AUDIO` segment is new to it, and it parses one anyway because all three checkpoints share one conditioning grammar. Ref2VA is the genuinely separate fine-tune, and it drops a frame anchor by frame 2 where FL2VA carries it through the clip. FL2VA also has the stronger turbo LoRA (v1.1 768p vs v0.1). |
 | `H3_AUDIO_ANCHOR=1` | Replaces the target audio rows with the reference on its own flow-matching trajectory after every Euler step. `x_s = (1-s)·x₀ + s·ε` is closed form, so this is exact and free. At the last step `s = 0` and those rows *are* the reference. |
 | `H3_REF2VA_ANCHOR=1` | Gives reference 1 the RoPE time coordinate target frame 0 will receive. An anchor is one number: keyframes and references take the same path through the DiT and differ only in that coordinate. |
 | `H3_REF2VA_ANCHOR_LAST=2` | Same for the last frame. The same image can serve both ends. |
@@ -526,12 +526,25 @@ not, and one replicate would not have told the difference.
 
 ## T2VA: the third checkpoint
 
-MiniMax publish three transformers, not two. `FL2VA/` and `Ref2VA/` sit beside a
-plain `transformer/` at the repo root: the base **text-to-audio-video** model,
-and the parent of every FastVideo distillation. h3.c needed no new code path for
-it — `h3_dit_load_t2va` already serves prompt-only runs, `h3_audio_vae_decode`
-already runs, and the waveform is already muxed. It is a third DiT weight set on
-machinery that was there.
+MiniMax publish three transformer directories, but **only two sets of weights**.
+`transformer/` at the repo root — the base text-to-audio-video model, and the
+parent of every FastVideo distillation — is byte-identical to
+`FL2VA/transformer/`. Nine tensors sampled by HTTP range request across blocks
+0, 25 and 49 plus three singletons: **max|diff| 0 on all nine**. The 638 vs 535
+tensor count is naming alone (diffusers splits qkv three ways, 50×2=100, plus
+2×2 in the token refiner, minus the native `rope.inv_freq`: 535+100+4−1=638).
+
+So FL2VA and T2VA are one network under two names, told apart only by what you
+feed it — first and last frames, or nothing. **Ref2VA is the one genuinely
+separate fine-tune.** That is why h3.c needed no new code path: `h3_dit_load_t2va`
+already served prompt-only runs, `h3_audio_vae_decode` already ran, the waveform
+was already muxed. And it is why the audio anchor was never teaching a model
+something foreign — this network always generated a soundtrack, and the anchor
+just pins down what it was going to produce anyway.
+
+What *is* different about the two on disk is the acceleration: FL2VA carries
+MiniMax's turbo LoRA, T2VA carries FastVideo's DMD2 four-step distillation of
+the same base.
 
 ```sh
 H3_DIT_VARIANT=T2VA \
@@ -546,6 +559,39 @@ H3_VAE_INT8_FFN=1 \
 sentence. The bundle shares its tokenizer, text encoder and VAEs with the other
 two — FastVideo's text encoder is byte-identical to MiniMax's, 1058 tensors and
 the same 66,714,780,128 bytes, so the int4 one already on disk serves all three.
+
+### The DMD student is the wrong accelerator for FLAT2V
+
+Since FL2VA and T2VA are the same base, the only thing separating them on disk
+is how they were accelerated — MiniMax's turbo LoRA against FastVideo's DMD2
+four-step distillation. So the DMD student can be dropped straight into the
+FLAT2V recipe. It should not be: three seeds each, same anchor, same references,
+same 3 forwards.
+
+| | aperture (42/7/3) | mean | lip-sync r | anchor0 | head |
+|---|---|---|---|---|---|
+| FL2VA turbo + linear (shipped) | 0.0898 0.0965 0.1000 | 0.0954 | **0.361** | 3.70 | **6.71** |
+| T2VA DMD + linear | 0.1069 0.1113 0.1048 | **0.1077** | 0.308 | 3.55 | 7.10 |
+| T2VA DMD + its own clock | 0.0989 0.0958 0.1034 | 0.0994 | 0.284 | **3.47** | 8.43 |
+
+Lip-sync is what this task is for, and the turbo LoRA wins it by 0.05–0.08 —
+well outside the spread across seeds — with the steadiest head as well.
+
+**The DMD student gets worse on its own schedule, not better.** Giving it the
+999/749/500/250 clock it was distilled for costs aperture (0.1077 → 0.0994),
+lip-sync (0.308 → 0.284) and head (7.10 → 8.43), all three moving together.
+Those four timesteps were distilled for *unconditional* text-to-audio-video,
+where no anchor intervenes. Few-step distillation buys its speed by compressing
+the intermediate steps away, and the audio anchor is exactly what runs *in* the
+intermediate steps — it writes the reference onto the trajectory after every
+Euler step, so fewer, longer strides mean fewer chances to correct. The linear
+grid takes more even steps and hands the anchor more of them.
+
+Note also that the DMD student has the **highest aperture and the worst
+lip-sync**. Aperture separates a talking take from a photograph; it cannot tell
+whether the mouth matches the voice. This is the first configuration measured
+here where the two metrics disagree, and the direction of the disagreement is
+the argument for keeping both.
 
 ### Converting the diffusers layout
 
