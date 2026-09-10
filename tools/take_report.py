@@ -153,8 +153,18 @@ def report(path, last=157, ref=None, src=None, with_aperture=True):
                 head = float(np.nanmean(step) / scale * 1000.0)
         except Exception:
             pass
+    # Worst frame anywhere in the take, not just its two ends. A segment can
+    # open and close on the poster -- the anchors see to that -- and melt into
+    # giant glyphs for forty frames in the middle, which neither anchor0 nor
+    # aperture nor a sampled caption detector is placed to notice. Distance
+    # from the poster, every tenth frame, and the maximum of it.
+    probe_idx = list(range(0, last + 1, 10))
+    if last not in probe_idx: probe_idx.append(last)
+    P = _frames(path, probe_idx)
+    drifts = [float(np.abs(P[i] - ref).mean()) for i in probe_idx]
     return dict(anchor0=float(np.abs(F[0] - ref).mean()),
                 anchor_last=float(np.abs(F[last] - ref).mean()),
+                drift_max=max(drifts), drift_med=float(np.median(drifts)),
                 scene=float(scene), aperture=ap, head=head, audio_r=r,
                 mb=os.path.getsize(path) / 1e6)
 
@@ -175,6 +185,10 @@ def verdict(m):
         return "AUDIO LOST"
     if m["aperture"] < 0.05:
         return "MOUTH FROZEN"
+    # a talking frame sits within ~2x the median of its own take; a frame that
+    # has melted into glyphs sits far outside it
+    if m.get("drift_max", 0) > 2.2 * max(m.get("drift_med", 1e-9), 1e-9) + 3:
+        return "FRAME CORRUPTED"
     if m["aperture"] < 0.088:
         return "under-articulating"
     # A head that holds still reads as a mannequin, and a viewer says so before

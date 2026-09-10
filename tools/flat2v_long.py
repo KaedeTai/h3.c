@@ -325,7 +325,10 @@ def pick_best(candidates):
     prompt: five of eleven segments came back with the spoken line burned in.
     Aperture cannot see a caption, so choosing by aperture alone chose them.
     """
-    clean = [c for c in candidates if c[3].get("subtitles", 0.0) <= SUBTITLE_LIMIT]
+    def corrupted(m):
+        return m.get("drift_max", 0) > 2.2 * max(m.get("drift_med", 1e-9), 1e-9) + 3
+    clean = [c for c in candidates
+             if c[3].get("subtitles", 0.0) <= SUBTITLE_LIMIT and not corrupted(c[3])]
     if clean:
         return max(clean, key=lambda c: c[0])
     # every take is captioned: least captioned wins, and say so
@@ -411,7 +414,8 @@ def cmd_redo(a):
             candidates.append((m["aperture"], target, seed, m))
             print(f"  segment {index+1:2d} seed {seed:3}: aperture {m['aperture']:.4f} "
                   f"head {m['head']:.2f} r {m['audio_r']:.3f} "
-                  f"subtitles {m['subtitles']:.0f}%", flush=True)
+                  f"subtitles {m['subtitles']:.0f}% drift {m['drift_max']:.0f}/{m['drift_med']:.0f}",
+                  flush=True)
         best = pick_best(candidates)
         print(f"  segment {index+1:2d} -> keeping seed {best[2]} "
               f"(aperture {best[0]:.4f})")
