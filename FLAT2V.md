@@ -444,9 +444,24 @@ And at 480×640 across five segments: with the line, 12 takes and 0 freezes;
 without it, 15 takes and 7 freezes. The spoken line is not a script — the mouth
 still follows the audio — it is a *stabiliser* that keeps the trajectory out of
 the photograph fixed point. Its cost is that on a larger canvas the picture may
-render it as a caption, which the redo picker now discards. Keep the line. The
-same string still serves every segment; the earlier conclusion that it can be
-shared was right, the conclusion that it can be dropped was not.
+render it as a caption, which the redo picker now discards.
+
+**And it has to be short.** Same hard slice, same six seeds, four prompts:
+
+| line in the prompt | talking | frozen |
+|---|---|---|
+| none | 0 | 6 |
+| the exact 35-character transcript of the slice | 0 | 6 |
+| 「健康最重要的就是預防。」— 11 characters, generic | **3** | 2 |
+| 「科技始於人性。」— 7 characters, generic | **3** | 2 |
+
+The two short lines produce the *same* seeds talking (7, 11, 13) and the same
+seeds frozen (3, 17): the outcome is seed × "a short line is present", and the
+content of the line does not enter. The transcript itself — the most
+"correct" text — behaves exactly like no text. The mechanism is not
+understood; the rule is: a short generic line, never the transcript, never
+nothing. The same string still serves every segment, so nothing about
+segmentation changes — only what goes in the string.
 
 ### Segment lengths must be legal
 
