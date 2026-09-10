@@ -764,6 +764,21 @@ machine here — resemblyzer scores the clone 0.854 against him and *two
 different men* 0.844 on this audio — so the voice was sent to the person who
 knows it, with the real recording beside it, before anything was built on it.
 
+**The clone speaks the reference text it was not given audio for.** Qwen3-TTS
+voice cloning takes a reference clip and its transcript, and treats the pair as
+a prefix it is continuing. When the transcript runs past the clip — here a
+15.5 s window cut at 「因為目標是非常清楚的」 but transcribed through
+「，就是這個晶片，就是引導AI。」 — the model first says the unsaid remainder, then
+the requested text. Every paragraph of the second narration opened with
+「就是這個晶片，就是引導AI」, 2.5 s each, and the track came out 21 s longer than
+the first for the same script. Nothing in the generation reports it. Two
+checks catch it: the track's length against the first clone of the same script
+(1.31× is not a speed setting), and an ASR pass (faster-whisper small, CPU)
+over the result, sentence by sentence against the script — which also gives
+the sentence timings the picture plan is keyed to. Transcribe the reference
+window with the same tool and hand the clone *that* text, trimmed to the last
+word actually inside the clip.
+
 **The bigger canvas renders the prompt.** Moving the talking head from 384×512
 to 480×640 made it visibly sharper — and five of eleven segments came back with
 「健康最重要的就是預防」 burned in as a caption. That string was the `--line` in the

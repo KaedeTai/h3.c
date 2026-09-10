@@ -361,6 +361,10 @@ def cmd_redo(a):
     if a.tail == "poster": env["H3_REF2VA_ANCHOR_LAST"] = "2"
     env.setdefault("H3_VAE_INT8_FFN", "1")
     which = [int(x) - 1 for x in a.segments.split(",")]
+    bad = [i + 1 for i in which if not 0 <= i < len(st["plan"])]
+    if bad:
+        print(f"ignoring segments not in this plan: {bad} (plan has {len(st['plan'])})")
+        which = [i for i in which if 0 <= i < len(st["plan"])]
     seeds = [int(x) for x in a.seeds.split(",")]
     # a fresh directory every time: !output numbers files from 1, and a poll
     # that finds a stale video-0001.mp4 from an earlier redo returns at once
