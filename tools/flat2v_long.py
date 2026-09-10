@@ -331,10 +331,12 @@ def pick_best(candidates):
              if c[3].get("subtitles", 0.0) <= SUBTITLE_LIMIT and not corrupted(c[3])]
     if clean:
         return max(clean, key=lambda c: c[0])
-    # every take is captioned: least captioned wins, and say so
-    worst = min(candidates, key=lambda c: c[3].get("subtitles", 0.0))
-    print(f"  every candidate is captioned; keeping the least "
-          f"({worst[3].get('subtitles', 0.0):.0f}%)")
+    # nothing clean: prefer uncorrupted, then least captioned, and say so
+    sane = [c for c in candidates if not corrupted(c[3])] or candidates
+    worst = min(sane, key=lambda c: c[3].get("subtitles", 0.0))
+    print(f"  no clean candidate; keeping the least captioned uncorrupted one "
+          f"({worst[3].get('subtitles', 0.0):.0f}%, drift "
+          f"{worst[3].get('drift_max', 0):.0f}/{worst[3].get('drift_med', 0):.0f})")
     return worst
 
 

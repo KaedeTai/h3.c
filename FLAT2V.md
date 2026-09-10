@@ -427,8 +427,26 @@ the spread within one prompt across seeds** (0.0065). `audio r` is 0.970 for all
 twelve takes to three decimals, and the subtitle rate is 0.0% for all of them.
 An unrelated sentence produces the same mouth as the correct one.
 
-The audio is the script. The text is set dressing, and the same string can be
-handed to every segment — which is what `flat2v_long.py` already does.
+The audio is the script: the text does not change *what* the mouth says.
+
+**Correction, measured later the same night: the text changes *whether the
+mouth moves at all* on a hard slice.** The twelve takes above were on one easy
+6.6-second clip, where nothing freezes either way, so there was nothing for the
+line to rescue. On a slice that freezes readily — segment 7 of the Total Swiss
+narration, 141 frames — at the same 384×512:
+
+| prompt | seeds | talking | frozen (aperture < 0.001) |
+|---|---|---|---|
+| line + direction | 5 | **3** (0.079, 0.064, 0.068) | 2 |
+| direction only | 6 | 0 | **6** |
+
+And at 480×640 across five segments: with the line, 12 takes and 0 freezes;
+without it, 15 takes and 7 freezes. The spoken line is not a script — the mouth
+still follows the audio — it is a *stabiliser* that keeps the trajectory out of
+the photograph fixed point. Its cost is that on a larger canvas the picture may
+render it as a caption, which the redo picker now discards. Keep the line. The
+same string still serves every segment; the earlier conclusion that it can be
+shared was right, the conclusion that it can be dropped was not.
 
 ### Segment lengths must be legal
 
