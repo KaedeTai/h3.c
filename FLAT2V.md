@@ -452,16 +452,20 @@ render it as a caption, which the redo picker now discards.
 |---|---|---|
 | none | 0 | 6 |
 | the exact 35-character transcript of the slice | 0 | 6 |
-| 「健康最重要的就是預防。」— 11 characters, generic | **3** | 2 |
+| "Prevention comes first." — English, not the spoken language | 1 | 4 |
+| 「預防。」— 2 characters | 2 | 3 |
 | 「科技始於人性。」— 7 characters, generic | **3** | 2 |
+| 「健康最重要的就是預防。」— 11 characters, generic | **3** | 2 |
 
 The two short lines produce the *same* seeds talking (7, 11, 13) and the same
 seeds frozen (3, 17): the outcome is seed × "a short line is present", and the
 content of the line does not enter. The transcript itself — the most
 "correct" text — behaves exactly like no text. The mechanism is not
-understood; the rule is: a short generic line, never the transcript, never
-nothing. The same string still serves every segment, so nothing about
-segmentation changes — only what goes in the string.
+understood, but its shape is: a *short* line in the *spoken* language. Two
+characters is weaker than seven; English barely registers; the full transcript
+is as good as nothing. The rule: a short generic line in the spoken language,
+never the transcript, never nothing. The same string still serves every
+segment, so nothing about segmentation changes — only what goes in the string.
 
 ### Segment lengths must be legal
 
