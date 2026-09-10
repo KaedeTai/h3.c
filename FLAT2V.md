@@ -743,3 +743,16 @@ and not: glyphs flip dozens of times across a row, cloth once or twice. And
 `redo` chose by aperture alone, which cannot see a caption, so it chose
 captioned takes over clean ones. It now discards any candidate over 5%
 captioned frames before comparing mouths.
+
+**And then the line turned out not to be inert after all — at this canvas.**
+Dropping it fixed the captions outright (0% on fifteen takes) and *seven of
+those fifteen froze into photographs*. Putting it back: twelve takes, zero
+freezes, five captioned. The earlier "inert" result was three seeds of one
+6.6-second take at 384×512, where nothing froze either way; it was true there
+and does not carry. At 480×640 the spoken line is doing two things at once —
+holding the mouth open and offering itself as a caption — and the right move is
+to keep it and let the picker discard the captioned takes, not to remove it and
+lose the articulation.
+
+Segment 7 is the case that shows the trade in one place: every take with the
+line was captioned, every take without it was frozen or nearly so.
