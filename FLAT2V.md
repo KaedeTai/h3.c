@@ -726,3 +726,20 @@ Lower the bar, not the standard: TTS voice similarity could not be verified by
 machine here — resemblyzer scores the clone 0.854 against him and *two
 different men* 0.844 on this audio — so the voice was sent to the person who
 knows it, with the real recording beside it, before anything was built on it.
+
+**The bigger canvas renders the prompt.** Moving the talking head from 384×512
+to 480×640 made it visibly sharper — and five of eleven segments came back with
+「健康最重要的就是預防」 burned in as a caption. That string was the `--line` in the
+prompt. The 384 block, same prompt, same poster crop, never did this: the extra
+tokens are room to draw text, and the prompt hands it the words. The spoken line
+was already proven inert for the mouth (§ *There is no per-segment text to
+split*), so it had no business being in the prompt at all; the direction alone
+is the prompt now.
+
+Two tool fixes came out of it. `subtitle_rate.py` lit up 100% of every 480×640
+frame — a white lab coat next to a dark tie passes the colour stage across the
+whole lower band — and now asks how often a row *switches* between text-like
+and not: glyphs flip dozens of times across a row, cloth once or twice. And
+`redo` chose by aperture alone, which cannot see a caption, so it chose
+captioned takes over clean ones. It now discards any candidate over 5%
+captioned frames before comparing mouths.

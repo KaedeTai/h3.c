@@ -63,12 +63,24 @@ def glyph_mask(frames):
     return mask
 
 
+TRANSITIONS = 8      # glyphs switch on/off many times across a row; a coat does not
+
+
 def has_subtitle(mask_frame):
-    """Geometry stage: a wide, banded run of glyph rows near the centre."""
+    """Geometry stage: a wide, banded run of glyph rows near the centre.
+
+    A white lab coat with a dark tie passes the colour stage across the whole
+    lower band at 480x640 -- white, next to dark -- and lit up every frame of a
+    clean take as SUBTITLED. What separates a line of text from a coat is not
+    how much of the row is "text-coloured" but how often it switches: glyphs
+    alternate on and off dozens of times across a row, cloth once or twice.
+    """
     h, w = mask_frame.shape
     lo, hi = int(w * (1 - CENTRE) / 2), int(w * (1 + CENTRE) / 2)
     roi = mask_frame[:, lo:hi]
-    rows = roi.sum(1) >= (hi - lo) * SPAN
+    wide = roi.sum(1) >= (hi - lo) * SPAN
+    flips = (roi[:, 1:] != roi[:, :-1]).sum(1)
+    rows = wide & (flips >= TRANSITIONS)
     run = best = 0
     for flag in rows:
         run = run + 1 if flag else 0

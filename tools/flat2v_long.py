@@ -307,9 +307,32 @@ def join_segments(st, out_dir, produced, tail):
 
 def grade_segment(st, index, path):
     from take_report import report
+    from subtitle_rate import rate as subtitle_rate
     os.environ["FLAT2V_REF"] = st["poster"]
     os.environ["FLAT2V_WAV"] = st["slices"][index]
-    return report(path, last=st["plan"][index] - 1)
+    m = report(path, last=st["plan"][index] - 1)
+    m["subtitles"] = subtitle_rate(path)
+    return m
+
+
+SUBTITLE_LIMIT = 5.0    # percent of frames; a caption for a moment is a caption
+
+
+def pick_best(candidates):
+    """Best mouth among the takes that are not captioned.
+
+    At 480x640 the picture has room to render text, and it renders the
+    prompt: five of eleven segments came back with the spoken line burned in.
+    Aperture cannot see a caption, so choosing by aperture alone chose them.
+    """
+    clean = [c for c in candidates if c[3].get("subtitles", 0.0) <= SUBTITLE_LIMIT]
+    if clean:
+        return max(clean, key=lambda c: c[0])
+    # every take is captioned: least captioned wins, and say so
+    worst = min(candidates, key=lambda c: c[3].get("subtitles", 0.0))
+    print(f"  every candidate is captioned; keeping the least "
+          f"({worst[3].get('subtitles', 0.0):.0f}%)")
+    return worst
 
 
 def cmd_redo(a):
@@ -387,8 +410,9 @@ def cmd_redo(a):
             m = grade_segment(st, index, target)
             candidates.append((m["aperture"], target, seed, m))
             print(f"  segment {index+1:2d} seed {seed:3}: aperture {m['aperture']:.4f} "
-                  f"head {m['head']:.2f} r {m['audio_r']:.3f}", flush=True)
-        best = max(candidates, key=lambda c: c[0])
+                  f"head {m['head']:.2f} r {m['audio_r']:.3f} "
+                  f"subtitles {m['subtitles']:.0f}%", flush=True)
+        best = pick_best(candidates)
         print(f"  segment {index+1:2d} -> keeping seed {best[2]} "
               f"(aperture {best[0]:.4f})")
         if best[1] != old:
