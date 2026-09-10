@@ -671,3 +671,58 @@ The checkpoint FastVideo recommend carries an extra `attn.to_gate_compress`
 consumes, and that neither base H3 nor the dense variant has. The converter
 drops them with a count. Use `…-Dense-DataFree` instead: 638 tensors, the same
 set as the base, `requires_vsa: false`.
+
+## Production: a 96-second brand film, end to end
+
+Built for 八馬國際 Total Swiss on the structure of their own event film — title
+card, atmosphere, theme card, the founder speaking, concept b-roll, close, end
+card. Everything moving is H3: FLAT2V for the founder, T2VA for the b-roll.
+The narration is Qwen3-TTS cloned from his voice. Cards are drawn. 1080p24.
+
+What the reference *provides* is not what it seems to provide, and three
+checks earned their keep before a single frame was generated.
+
+**The reference's audio is not his voice alone.** The founder's talking points
+sit at 1:27–3:00 of the source — but a speaker embedding (resemblyzer) against
+his on-camera close-up splits the window cleanly: 1:27–1:41 is another speaker
+quoting him (similarity 0.55–0.72), 1:41 onward is him (0.80–0.88). The first
+fourteen seconds would have been lip-synced to the wrong man. Under every voice
+there is also a music bed; demucs (`htdemucs`, two stems) lifts it, and only
+then does the silence planner find pauses to cut in — quiet frames go from 1%
+to 29% of the track.
+
+**Real recordings and TTS round-trip the audio VAE at 0.93–0.95, not 0.97.**
+The 0.95 line for AUDIO LOST was calibrated on a soundtrack h3 had itself
+produced, which the VAE reproduces almost perfectly. Any real input lands
+lower with the mouth plainly driven, so the line now sits at 0.90.
+
+**One link in a long chain drops into the photograph fixed point on its own.**
+Eleven silence-cut segments at seed 42: two came out with aperture 0.0007 —
+mouth shut for the whole segment — while every neighbour talked. The run does
+not need repeating; the link does. `flat2v_long.py WORK redo --segments 7,10
+--seeds 7,3,11` regenerates just those, keeps the best aperture of the
+candidates, and rejoins. The next segment's first anchor was taken from the old
+version, but with the poster as tail anchor every version ends within
+reproduction error of the same frame, so the seam holds without cascading.
+Seed 3 lifted segment 7 from 0.0007 to 0.0986; seed 7 lifted segment 10 from
+0.0010 to 0.0878.
+
+**The narration is the timeline.** The voice is one continuous 68 s take; the
+picture cuts between the talking head and b-roll on top of it, keyed to what he
+is saying — the ECG under 「會碰到什麼樣的挑戰」, the digital twin under 「拍幾張
+你的照片，錄下你的聲音」, the chip under 「晶片的解讀」. The 384×512 portrait sits
+on a blurred copy of itself to fill 16:9. h3's own audio is dropped from every
+talking-head window and the clean narration laid over the whole span, the same
+reasoning as the long-form join.
+
+**B-roll at 640×384 holds for concept shots and fails for structured rooms.**
+Chip macro, neurons, ECG, the glowing figure, Earth, a conference hall — usable
+at the first or second seed. A cleanroom, a wet lab, "dividing cells" —
+collapsed into texture at both seeds. 240 tokens a frame is enough for a
+subject on a soft ground and not for a room full of edges; the same canvas
+floor the face found, met from the other side.
+
+Lower the bar, not the standard: TTS voice similarity could not be verified by
+machine here — resemblyzer scores the clone 0.854 against him and *two
+different men* 0.844 on this audio — so the voice was sent to the person who
+knows it, with the real recording beside it, before anything was built on it.

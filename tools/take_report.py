@@ -122,9 +122,13 @@ def report(path, last=157, ref=None, src=None, with_aperture=True):
         ref = np.asarray(Image.open(_ref()).convert("RGB")).astype(np.float32)
     if src is None:
         src = _audio(_wav())
-    idxs = [0, 1, 40, 41, 80, 81, 120, 121, last]
+    # scene probes at quarter points, so a short legal segment (107 frames
+    # from the silence planner) grades as well as a 158-frame take
+    probes = [int(round(last * q)) for q in (0.0, 0.25, 0.5, 0.75)]
+    probes = [p for p in probes if p + 1 < last]
+    idxs = sorted({0, last, *probes, *[p + 1 for p in probes]})
     F = _frames(path, idxs)
-    scene = np.mean([np.abs(F[b] - F[a]).mean() for a, b in ((0, 1), (40, 41), (80, 81), (120, 121))])
+    scene = np.mean([np.abs(F[p + 1] - F[p]).mean() for p in probes])
     a = _audio(path)
     n = min(len(a), len(src))
     aa, ss = a[:n] - a[:n].mean(), src[:n] - src[:n].mean()
@@ -163,7 +167,11 @@ def verdict(m):
     for name in ("aperture", "head", "audio_r"):
         if m.get(name) != m.get(name):
             return f"NOT GRADED ({name} unmeasured)"
-    if m["audio_r"] < 0.95:
+    # 0.95 was calibrated on a soundtrack h3 had itself produced, which the
+    # audio VAE round-trips almost perfectly. Real recordings and TTS land at
+    # 0.93-0.95 through the same anchor with the mouth plainly driven, so the
+    # line that means "the anchor did not take" sits lower.
+    if m["audio_r"] < 0.90:
         return "AUDIO LOST"
     if m["aperture"] < 0.05:
         return "MOUTH FROZEN"

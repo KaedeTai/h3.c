@@ -262,26 +262,7 @@ def cmd_run(a):
     # approximation, 158/6.575 = 24.03 is the truth), and lay the ORIGINAL
     # source audio over the result. The soundtrack was an input all along; there
     # is no reason for the deliverable to carry a VAE round trip of it.
-    listing = os.path.join(out_dir, "segments.txt")
-    with open(listing, "w") as f:
-        for p in produced:
-            f.write(f"file '{os.path.abspath(p)}'\n")
-    video_only = os.path.join(out_dir, "video_only.mp4")
-    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-                    "-i", listing, "-an", "-c", "copy", video_only], check=True)
-    video_seconds = sum(st["plan"]) / FPS
-    audio_seconds = sum(st["spans"])
-    scale = audio_seconds / video_seconds
-    joined = os.path.join(st["workdir"], f"long_{a.tail}.mp4")
-    subprocess.run(["ffmpeg", "-y", "-v", "error",
-                    "-itsscale", f"{scale:.9f}", "-i", video_only,
-                    "-i", st["voice"],
-                    "-map", "0:v", "-map", "1:a", "-c:v", "copy",
-                    "-af", "pan=mono|c0=0.5*c0+0.5*c1,highpass=f=60",
-                    "-c:a", "aac", "-b:a", "128k", "-ac", "1", "-ar", "32000",
-                    "-t", f"{audio_seconds:.6f}", joined], check=True)
-    print(f"  joined at {sum(st['plan'])/audio_seconds:.3f} fps "
-          f"(24 fps would drift {1000*(video_seconds-audio_seconds):.0f} ms)")
+    joined = join_segments(st, out_dir, produced, a.tail)
 
     st.setdefault("runs", {})[a.tail] = {
         "segments": produced, "timings": timings, "joined": joined,
@@ -295,6 +276,132 @@ def cmd_run(a):
           f"{min(timings[1:]) if len(timings)>1 else 0:.1f}"
           f"-{max(timings[1:]) if len(timings)>1 else 0:.1f}s")
     print(f"  -> {joined}")
+
+
+
+def join_segments(st, out_dir, produced, tail):
+    """Video-only concat, rescaled to the true audio clock, source audio laid over."""
+    listing = os.path.join(out_dir, "segments.txt")
+    with open(listing, "w") as f:
+        for p in produced:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+    video_only = os.path.join(out_dir, "video_only.mp4")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                    "-i", listing, "-an", "-c", "copy", video_only], check=True)
+    video_seconds = sum(st["plan"]) / FPS
+    audio_seconds = sum(st["spans"])
+    scale = audio_seconds / video_seconds
+    joined = os.path.join(st["workdir"], f"long_{tail}.mp4")
+    subprocess.run(["ffmpeg", "-y", "-v", "error",
+                    "-itsscale", f"{scale:.9f}", "-i", video_only,
+                    "-i", st["voice"],
+                    "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                    "-af", "pan=mono|c0=0.5*c0+0.5*c1,highpass=f=60",
+                    "-c:a", "aac", "-b:a", "128k", "-ac", "1", "-ar", "32000",
+                    "-t", f"{audio_seconds:.6f}", joined], check=True)
+    print(f"  joined at {sum(st['plan'])/audio_seconds:.3f} fps "
+          f"(24 fps would drift {1000*(video_seconds-audio_seconds):.0f} ms)")
+    return joined
+
+
+
+def grade_segment(st, index, path):
+    from take_report import report
+    os.environ["FLAT2V_REF"] = st["poster"]
+    os.environ["FLAT2V_WAV"] = st["slices"][index]
+    return report(path, last=st["plan"][index] - 1)
+
+
+def cmd_redo(a):
+    """Re-roll one or more segments with other seeds and keep the best mouth.
+
+    A long run is a chain, and one link in it can drop into the photograph
+    fixed point -- aperture 0.0007, mouth shut for six seconds -- while every
+    neighbour is fine. The run does not need repeating; the link does. Its
+    first anchor is already on disk (the previous segment's last frame) and
+    its last anchor is the poster, so it regenerates independently. The next
+    segment's first anchor was taken from the OLD version of this one, but with
+    the poster as tail anchor every version ends within reproduction error of
+    the same frame, so the seam holds without cascading.
+    """
+    st = load(a.workdir)
+    run = st["runs"][a.tail]
+    out_dir = os.path.join(st["workdir"], f"seg_{a.tail}")
+    env = dict(os.environ)
+    env["H3_DIT_VARIANT"] = "FL2VA"; env["H3_AUDIO_ANCHOR"] = "1"
+    env["H3_REF2VA_ANCHOR"] = "1"
+    if a.tail == "poster": env["H3_REF2VA_ANCHOR_LAST"] = "2"
+    env.setdefault("H3_VAE_INT8_FFN", "1")
+    which = [int(x) - 1 for x in a.segments.split(",")]
+    seeds = [int(x) for x in a.seeds.split(",")]
+    # a fresh directory every time: !output numbers files from 1, and a poll
+    # that finds a stale video-0001.mp4 from an earlier redo returns at once
+    # with the wrong take
+    redo_dir = os.path.join(out_dir, f"redo_{int(time.time())}")
+    os.makedirs(redo_dir)
+    # one resident process for every candidate: rebind makes each one cheap
+    first = which[0]
+    anchor0 = (st["poster"] if first == 0 else
+               os.path.join(out_dir, f"anchor_{first:03d}.png"))
+    cmd = [H3, "-d", st["model_dir"], "--ref-image", anchor0]
+    if a.tail == "poster": cmd += ["--ref-image", st["poster"]]
+    cmd += ["--ref-audio", st["slices"][first],
+            "--width", str(st["width"]), "--height", str(st["height"]),
+            "--frames", str(st["plan"][first]), "--steps", str(st["steps"]),
+            "--seed", str(seeds[0]), "--use-int8-row-fc2"]
+    log = open(os.path.join(redo_dir, "h3.log"), "a")
+    proc = subprocess.Popen(cmd, cwd=H3_DIR, env=env, stdin=subprocess.PIPE,
+                            stdout=log, stderr=subprocess.STDOUT, text=True)
+    def feed(lines):
+        for l in lines: proc.stdin.write(l + "\n")
+        proc.stdin.flush()
+    feed([f"!output {redo_dir}"])
+    counter = 0
+    replaced = []
+    for index in which:
+        anchor = (st["poster"] if index == 0 else
+                  os.path.join(out_dir, f"anchor_{index:03d}.png"))
+        old = run["segments"][index]
+        candidates = []
+        if os.path.exists(old):
+            m = grade_segment(st, index, old)
+            candidates.append((m["aperture"], old, run.get("seed", "?"), m))
+        for seed in seeds:
+            counter += 1
+            refs = ["!refs clear", f"!ref-image {anchor}"]
+            refs.append(f"!frames {st['plan'][index]}")
+            if a.tail == "poster": refs.append(f"!ref-image {st['poster']}")
+            refs += [f"!ref-audio {st['slices'][index]}", f"!seed {seed}", st["prompt"]]
+            feed(refs)
+            target = os.path.join(redo_dir, f"video-{counter:04d}.mp4")
+            started, size = time.time(), -1
+            while time.time() - started < 300:
+                if proc.poll() is not None: break
+                if os.path.exists(target):
+                    now = os.path.getsize(target)
+                    if now and now == size: break
+                    size = now
+                time.sleep(0.5)
+            if not os.path.exists(target):
+                print(f"  segment {index+1} seed {seed}: h3 produced nothing"); continue
+            m = grade_segment(st, index, target)
+            candidates.append((m["aperture"], target, seed, m))
+            print(f"  segment {index+1:2d} seed {seed:3}: aperture {m['aperture']:.4f} "
+                  f"head {m['head']:.2f} r {m['audio_r']:.3f}", flush=True)
+        best = max(candidates, key=lambda c: c[0])
+        print(f"  segment {index+1:2d} -> keeping seed {best[2]} "
+              f"(aperture {best[0]:.4f})")
+        if best[1] != old:
+            shutil.copy(best[1], old)
+            replaced.append(index + 1)
+            if index + 1 < len(run["segments"]):
+                last_frame(old, os.path.join(out_dir, f"anchor_{index+1:03d}.png"),
+                           st["plan"][index])
+    feed(["!quit"]); proc.wait()
+    joined = join_segments(st, out_dir, run["segments"], a.tail)
+    run.setdefault("redone", []).extend(replaced)
+    save(a.workdir, st)
+    print(f"  replaced segments {replaced or 'none'}; rejoined -> {joined}")
 
 
 def cmd_check(a):
@@ -362,6 +469,10 @@ def main():
     r.add_argument("--tail", choices=("poster", "none"), default="poster")
     r.add_argument("--seed", type=int, default=42)
     sub.add_parser("check").set_defaults(fn=cmd_check)
+    d = sub.add_parser("redo"); d.set_defaults(fn=cmd_redo)
+    d.add_argument("--segments", required=True, help="1-based, comma-separated")
+    d.add_argument("--seeds", default="7,3,11")
+    d.add_argument("--tail", choices=("poster", "none"), default="poster")
     a = p.parse_args(); a.fn(a)
 
 
