@@ -621,6 +621,11 @@ the same 66,714,780,128 bytes, so the int4 one already on disk serves all three.
 
 ### The spoken script has to fill the clip, or the model writes its own
 
+*Superseded in part by [T2VA_TIMING.md](T2VA_TIMING.md), which measures what a
+staged prompt does: the clip only has to be filled when the prompt gives the
+model nothing else to do with the time. With a beat structure a short line is
+placed rather than padded, and the silence is real.*
+
 For T2VA the prompt *is* the script, so its length is a duration, not a style
 choice. h3 speaks Mandarin at roughly **4 characters a second**, so a 10.125 s
 clip wants about 40 characters. Give it 20 and the model does not slow down or
