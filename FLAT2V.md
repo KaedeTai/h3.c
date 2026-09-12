@@ -39,6 +39,15 @@ the first in one resident process, against 417 s unaccelerated.
 
 ## Sharp edges
 
+**`H3_VAE_INT8_FFN=1` is not a nicety — without it the decoder costs more than
+the whole DiT.** It is in the recipe above and it is the easiest line to drop
+when writing a command by hand. Same clip both ways, 243 frames at 608×352,
+3 steps: video VAE decode **69.2 s without it, 16.9 s with it — 4.1x** — turning
+a 120.5 s run into 74.9 s. Omitting it does not just cost time, it moves the
+bottleneck and invites the wrong conclusion: a profile taken without the flag
+says the decoder is 57% of the run and the DiT only 36%, when the truth is 22%
+and 58%.
+
 **The voice clip length is exact.** It must encode to `round(frames·40/24)` audio
 latent frames. 158 frames wants **6.575 s**, not 158/24 = 6.583 s. h3 refuses a
 mismatch rather than misaligning.
@@ -60,6 +69,19 @@ clinic shot. Canvas and seed only modulate the wide crop's odds. A caption
 belongs to the model's prior for a short-form social clip, and what selects that
 prior is what the shot looks like, not what the prompt claims about it. Grade it
 with `tools/subtitle_rate.py`.
+
+Confirmed on a second subject months later. A night-market vlogger at 608×352,
+the wide framing — woman at screen-left, the stall and its signage filling the
+right half — carried burned-in Mandarin captions on **8 runs out of 8**, across
+T2VA and FL2VA, 3 and 6 steps, and whether the prompt named the line or was
+English only. Reframed to head-and-shoulders with the aisle reduced to bokeh
+behind her, the same prompt and seed: **0 of 3**. Negation in the prompt ("no
+subtitles, no captions, no on-screen text") did nothing in either framing, as
+the recipe table already says. Note also that a poster cropped from a captioned
+take carries its caption band into every anchored run that uses it — the
+cheapest fix there is to generate the poster with a 22-frame clip rather than
+harvest one.
+
 
 **Crop to the head, not to the room.** The DiT's cost is tokens and a token is
 32×32 px of canvas, so at 480×640 the shirt, tie, bookshelf and certificates are
@@ -596,6 +618,29 @@ H3_VAE_INT8_FFN=1 \
 sentence. The bundle shares its tokenizer, text encoder and VAEs with the other
 two — FastVideo's text encoder is byte-identical to MiniMax's, 1058 tensors and
 the same 66,714,780,128 bytes, so the int4 one already on disk serves all three.
+
+### The spoken script has to fill the clip, or the model writes its own
+
+For T2VA the prompt *is* the script, so its length is a duration, not a style
+choice. h3 speaks Mandarin at roughly **4 characters a second**, so a 10.125 s
+clip wants about 40 characters. Give it 20 and the model does not slow down or
+leave a pause — it invents the rest. A 20-character line over 243 frames came
+back as "那煎炸的藕紫白是別人背的從最後煎的還越好吃…" for six seconds and only
+then reached the line that was actually asked for; whisper against the script
+scores the first two thirds as pure invention. The same shot with a
+39-character line is correct word for word from the third character on.
+
+This is the one place where FL2VA is categorically safer than T2VA: with the
+soundtrack supplied, length is whatever the wav is, and the prompt's job shrinks
+to the short generic stabiliser of the previous section. Measured on the same
+10.125 s clip: T2VA 3 steps 74.9 s, T2VA 6 steps 117.2 s, FL2VA 3 steps 84.9 s —
+FL2VA's extra 10 s buys two reference images and an anchored mouth.
+
+**The cheap-layer flags destroy speech before they touch the picture.**
+`--core-reuse 4 --layers 45` cut the same clip's denoise from 43.7 s to 25.9 s,
+a real 41%, and the picture survived — but the soundtrack came out as
+「天使天使天使…」 repeated to the end of the clip. Grade audio, not just frames,
+before trusting any of those knobs.
 
 ### The DMD student is the wrong accelerator for FLAT2V
 

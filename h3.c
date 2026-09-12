@@ -1350,12 +1350,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             presentations[index].has_audio = 1;
             if (want_audio_anchor && !audio_anchor) {
                 if (latent.length != temporal.audio_t) {
+                    /* Read the length before the free: h3_audio_latent_free
+                     * zeroes the struct, so reporting latent.length after it
+                     * printed "encodes to 0 latent frames" for every mismatch
+                     * and sent the reader looking for a decode failure that
+                     * had not happened. */
+                    int encoded = latent.length;
                     h3_audio_latent_free(&latent);
                     h3_set_error(ctx,
                         "audio anchor: reference encodes to %d latent frames "
                         "but the target needs %d (%d video frames); pad or "
                         "trim the clip to %.3f s",
-                        latent.length, temporal.audio_t, temporal.frame_count,
+                        encoded, temporal.audio_t, temporal.frame_count,
                         (double)temporal.audio_t / H3_AUDIO_LATENT_FPS);
                     goto cleanup;
                 }
