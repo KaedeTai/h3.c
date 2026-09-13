@@ -1,0 +1,570 @@
+diff --git a/app/services/h3_local.py b/app/services/h3_local.py
+new file mode 100644
+index 0000000..2e0fa0b
+--- /dev/null
++++ b/app/services/h3_local.py
+@@ -0,0 +1,125 @@
++"""Local MiniMax-H3 video generation through the h3.c binary.
++
++This is the same model the ``metaso_minimax`` provider reaches over the
++network, run on the operator's own GPU instead. The difference that matters to
++the pipeline is not speed but billing: a clip costs nothing, so none of the
++paid-provider machinery — unconfirmed-task errors, stop-on-first-failure, "do
++not retry because it may already have been charged" — applies here. Failures
++are ordinary failures and the loop simply moves to the next search term.
++
++Requires github.com/KaedeTai/h3.c built, and its model directory present. See
++``[app] h3_local_*`` in config.example.toml.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++
++from loguru import logger
++
++from app.config import config
++from app.models.schema import MaterialInfo, VideoAspect
++from app.services import h3_runner
++from app.services.h3_runner import H3RunnerError
++
++# Re-exported so material.py can catch one name without importing the runner.
++H3LocalError = H3RunnerError
++
++DEFAULT_STEPS = 3
++DEFAULT_MIN_DURATION = 3
++DEFAULT_MAX_DURATION = 10
++DEFAULT_TIMEOUT = 900.0
++
++
++def _setting(name: str, default: Any = "") -> Any:
++    value = config.app.get(name, default)
++    if isinstance(value, str):
++        return value.strip()
++    return value
++
++
++def is_configured() -> bool:
++    """True when a usable h3 binary is on disk.
++
++    Checked before the pipeline spends time on a script, the same way the paid
++    providers check their API keys — a missing binary should fail in preflight,
++    not forty seconds into the first clip.
++    """
++    binary = str(_setting("h3_local_binary") or os.environ.get("H3_BINARY", ""))
++    if not binary:
++        return False
++    binary = os.path.abspath(os.path.expanduser(binary))
++    return os.path.isfile(binary) and os.access(binary, os.X_OK)
++
++
++def _clamp_duration(minimum_duration: int) -> float:
++    low = float(_setting("h3_local_min_duration", DEFAULT_MIN_DURATION) or DEFAULT_MIN_DURATION)
++    high = float(_setting("h3_local_max_duration", DEFAULT_MAX_DURATION) or DEFAULT_MAX_DURATION)
++    if low > high:
++        raise H3LocalError(
++            f"h3_local_min_duration ({low}) must not exceed h3_local_max_duration ({high})"
++        )
++    try:
++        wanted = float(minimum_duration)
++    except (TypeError, ValueError) as exc:
++        raise H3LocalError(f"clip duration must be a number, got {minimum_duration!r}") from exc
++    return max(low, min(high, wanted))
++
++
++def generate_videos(
++    search_term: str,
++    minimum_duration: int,
++    video_aspect: VideoAspect = VideoAspect.portrait,
++    *,
++    output_dir: str = "",
++    seed: int = 42,
++) -> list[MaterialInfo]:
++    """Render one clip for one search term and return it as local material.
++
++    Signature matches ``volcengine_seedance.generate_videos`` and friends so the
++    dispatcher treats it the same way, except that ``url`` is already a path on
++    disk: there is nothing to download, so the caller must not try.
++    """
++    binary = str(_setting("h3_local_binary") or os.environ.get("H3_BINARY", ""))
++    if not binary:
++        raise H3LocalError("h3_local requires h3_local_binary in config")
++
++    aspect = VideoAspect(video_aspect)
++    seconds = _clamp_duration(minimum_duration)
++    prompt = h3_runner.build_prompt(
++        search_term, str(_setting("h3_local_prompt_template") or "")
++    )
++    directory = output_dir or os.path.join(os.getcwd(), "storage", "cache_videos")
++    path = h3_runner.new_clip_path(directory, prefix="h3")
++
++    clip = h3_runner.render_clip(
++        prompt=prompt,
++        output_path=path,
++        seconds=seconds,
++        aspect=aspect.value,
++        resolution_override=str(_setting("h3_local_resolution") or ""),
++        steps=int(_setting("h3_local_steps", DEFAULT_STEPS) or DEFAULT_STEPS),
++        seed=seed,
++        binary=binary,
++        model_dir=str(_setting("h3_local_model_dir") or "./MiniMax-H3-turbo-int8"),
++        timeout=float(_setting("h3_local_run_timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
++    )
++    logger.info(
++        f"h3 rendered {clip.frames} frames at {clip.width}x{clip.height} "
++        f"({clip.duration:.2f}s) in {clip.wall_seconds:.1f}s: {search_term}"
++    )
++    return [
++        MaterialInfo(
++            provider="h3_local",
++            url=clip.path,
++            duration=int(clip.duration),
++            source_info={
++                "provider": "h3_local",
++                "search_term": search_term,
++                "asset_id": os.path.basename(clip.path),
++                "width": clip.width,
++                "height": clip.height,
++            },
++        )
++    ]
+diff --git a/app/services/h3_runner.py b/app/services/h3_runner.py
+new file mode 100644
+index 0000000..fcbd31e
+--- /dev/null
++++ b/app/services/h3_runner.py
+@@ -0,0 +1,219 @@
++"""Drive the local h3.c binary. Standard library only, no project imports.
++
++Kept free of MoneyPrinterTurbo types on purpose: this half is the part that has
++to be testable on the machine that actually owns the GPU, where installing
++moviepy and streamlit to check a subprocess call would be absurd.
++
++h3 is MiniMax-H3 compiled to C + Metal (github.com/KaedeTai/h3.c). The T2VA
++checkpoint turns a prompt into video *and* a soundtrack; this module always
++strips the soundtrack, because the caller lays its own narration over the cut
++and a second voice underneath it is never wanted.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import shutil
++import subprocess
++import time
++import uuid
++from dataclasses import dataclass
++
++# h3 only accepts frame counts on this lattice (the video VAE's temporal
++# grouping): 5, 22, 39, ... Asking for anything else is refused outright.
++_FRAME_BASE = 5
++_FRAME_STEP = 17
++_FPS = 24
++
++# The VAE downsamples 16x and the patch is 2x2, so one token covers 32x32
++# pixels and both edges must be multiples of 32. These are the closest such
++# sizes to each aspect at roughly 0.18 MP, which is the point measured at
++# ~75 s for a 10 s clip on an M5 Max; larger canvases cost quadratically more
++# in attention and start drawing captions.
++_ASPECT_SIZES = {
++    "9:16": (320, 576),
++    "16:9": (576, 320),
++    "1:1": (448, 448),
++}
++
++_DEFAULT_PROMPT_TEMPLATE = (
++    "({term}, cinematic stock footage, natural light, shallow depth of field, "
++    "slow steady camera, ambient sound only)"
++)
++
++
++class H3RunnerError(RuntimeError):
++    """h3 could not produce a usable clip.
++
++    There is deliberately no "unconfirmed task" variant of this error, which
++    every paid provider in this project needs: local generation costs nothing,
++    so a retry is always safe and never has to be reconciled against a bill.
++    """
++
++
++@dataclass(frozen=True)
++class H3Clip:
++    path: str
++    duration: float
++    frames: int
++    width: int
++    height: int
++    seed: int
++    prompt: str
++    wall_seconds: float
++
++
++def legal_frames(seconds: float, *, max_frames: int = 243) -> int:
++    """Smallest frame count h3 accepts that covers `seconds`."""
++    if not math.isfinite(seconds) or seconds <= 0:
++        raise H3RunnerError(f"clip duration must be positive and finite, got {seconds!r}")
++    wanted = math.ceil(seconds * _FPS)
++    k = max(0, math.ceil((wanted - _FRAME_BASE) / _FRAME_STEP))
++    frames = _FRAME_BASE + _FRAME_STEP * k
++    return min(frames, max_frames)
++
++
++def canvas_for_aspect(aspect: str, override: str = "") -> tuple[int, int]:
++    """Pixel size for an aspect string, or an explicit `WIDTHxHEIGHT` override."""
++    if override:
++        try:
++            w_text, h_text = override.lower().split("x", 1)
++            width, height = int(w_text), int(h_text)
++        except ValueError as exc:
++            raise H3RunnerError(
++                f"h3 resolution override must look like 576x320, got {override!r}"
++            ) from exc
++        if width % 32 or height % 32:
++            raise H3RunnerError(
++                f"h3 canvas edges must be multiples of 32, got {width}x{height}"
++            )
++        return width, height
++    try:
++        return _ASPECT_SIZES[aspect]
++    except KeyError as exc:
++        raise H3RunnerError(f"unsupported aspect {aspect!r}") from exc
++
++
++def build_prompt(term: str, template: str = "") -> str:
++    """Wrap a bare search term in visual direction.
++
++    The caller hands us one to three English words ("night market food"), which
++    on its own tells the model nothing about the shot. Direction written in
++    English conditions the picture without being spoken; Mandarin in the prompt
++    would be read aloud, so nothing here is ever in the spoken language.
++    """
++    cleaned = " ".join(str(term or "").split())
++    if not cleaned:
++        raise H3RunnerError("search term must not be empty")
++    return (template or _DEFAULT_PROMPT_TEMPLATE).format(term=cleaned)
++
++
++def _strip_audio(src: str, dst: str, ffmpeg: str) -> None:
++    """Remux without the soundtrack. Copies the video stream, so it is cheap."""
++    result = subprocess.run(
++        [ffmpeg, "-y", "-v", "error", "-i", src, "-c:v", "copy", "-an", dst],
++        capture_output=True, text=True,
++    )
++    if result.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
++        raise H3RunnerError(
++            f"could not strip the generated soundtrack: {result.stderr.strip()[:400]}"
++        )
++
++
++def render_clip(
++    *,
++    prompt: str,
++    output_path: str,
++    seconds: float,
++    aspect: str = "9:16",
++    resolution_override: str = "",
++    steps: int = 3,
++    seed: int = 42,
++    binary: str = "",
++    model_dir: str = "./MiniMax-H3-turbo-int8",
++    timeout: float = 900.0,
++    keep_audio: bool = False,
++) -> H3Clip:
++    """Generate one clip with h3 and return where it landed.
++
++    One process per clip. The model load is 3-8 s against 40-75 s of denoising,
++    so a resident worker would save under 10%; it is worth doing later, but not
++    at the cost of a REPL protocol in the first version of this provider.
++    """
++    h3_binary = binary or os.environ.get("H3_BINARY", "")
++    if not h3_binary:
++        raise H3RunnerError("h3 binary path is not configured")
++    h3_binary = os.path.abspath(os.path.expanduser(h3_binary))
++    if not (os.path.isfile(h3_binary) and os.access(h3_binary, os.X_OK)):
++        raise H3RunnerError(f"h3 binary is missing or not executable: {h3_binary}")
++
++    ffmpeg = shutil.which("ffmpeg") or ""
++    if not keep_audio and not ffmpeg:
++        raise H3RunnerError("ffmpeg is required to strip the generated soundtrack")
++
++    width, height = canvas_for_aspect(aspect, resolution_override)
++    frames = legal_frames(seconds)
++    if steps <= 0:
++        raise H3RunnerError(f"steps must be positive, got {steps}")
++
++    workdir = os.path.dirname(h3_binary)
++    output_path = os.path.abspath(output_path)
++    os.makedirs(os.path.dirname(output_path), exist_ok=True)
++    raw_path = output_path if keep_audio else f"{output_path}.withaudio.mp4"
++
++    env = dict(os.environ)
++    env["H3_DIT_VARIANT"] = "T2VA"
++    # Without this the video VAE decode costs more than the whole transformer:
++    # 69 s against 17 s on a 10 s clip. It is the single most expensive flag to
++    # forget, which is why it is set here rather than left to config.
++    env["H3_VAE_INT8_FFN"] = "1"
++    for stale in ("H3_AUDIO_ANCHOR", "H3_REF2VA_ANCHOR", "H3_REF2VA_ANCHOR_LAST"):
++        env.pop(stale, None)
++
++    command = [
++        h3_binary, "-d", model_dir, "-p", prompt, "-o", raw_path,
++        "--width", str(width), "--height", str(height),
++        "--frames", str(frames), "--steps", str(steps),
++        "--seed", str(seed), "--use-int8-row-fc2",
++    ]
++
++    started = time.time()
++    try:
++        result = subprocess.run(
++            command, cwd=workdir, env=env, capture_output=True, text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired as exc:
++        raise H3RunnerError(
++            f"h3 did not finish within {timeout:.0f}s for prompt {prompt[:60]!r}"
++        ) from exc
++    wall = time.time() - started
++
++    if result.returncode != 0:
++        tail = (result.stdout or "").replace("\r", "\n").strip().splitlines()[-3:]
++        raise H3RunnerError(
++            f"h3 exited with {result.returncode}: {' / '.join(tail) or 'no output'}"
++        )
++    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
++        raise H3RunnerError(f"h3 reported success but wrote no video to {raw_path}")
++
++    if not keep_audio:
++        _strip_audio(raw_path, output_path, ffmpeg)
++        os.remove(raw_path)
++
++    return H3Clip(
++        path=output_path,
++        duration=frames / _FPS,
++        frames=frames,
++        width=width,
++        height=height,
++        seed=seed,
++        prompt=prompt,
++        wall_seconds=wall,
++    )
++
++
++def new_clip_path(directory: str, prefix: str = "h3") -> str:
++    os.makedirs(directory, exist_ok=True)
++    return os.path.join(directory, f"{prefix}-{uuid.uuid4().hex[:12]}.mp4")
+diff --git a/app/services/material.py b/app/services/material.py
+index f1de37a..66b8d83 100644
+--- a/app/services/material.py
++++ b/app/services/material.py
+@@ -18,6 +18,7 @@ from PIL import Image, UnidentifiedImageError
+ from app.config import config
+ from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
+ from app.services import (
++    h3_local,
+     material_cache,
+     metaso_minimax,
+     ofox,
+@@ -1706,6 +1707,19 @@ def download_videos(
+             max_clip_duration=max_clip_duration,
+             material_directory=material_directory,
+         )
++    if source == "h3_local":
++        # Local generation is free, so unlike the paid generative sources this
++        # one has no "stop everything, a task may already be billed" path: a
++        # failed clip is skipped and the loop carries on to the next term.
++        return _download_videos_h3_local_on_demand(
++            task_id=task_id,
++            search_terms=search_terms,
++            video_aspect=video_aspect,
++            audio_duration=audio_duration,
++            max_clip_duration=max_clip_duration,
++            material_directory=material_directory,
++        )
++
+     if source == "volcengine_seedance":
+         # 与 WaveSpeed 相同，方舟官方接口会创建异步付费任务。必须按需逐段
+         # 生成，只购买当前配音时长真正需要的素材。
+@@ -1908,6 +1922,98 @@ def _download_videos_wavespeed_on_demand(
+     return video_paths
+ 
+ 
++def _download_videos_h3_local_on_demand(
++    *,
++    task_id: str,
++    search_terms: List[str],
++    video_aspect: VideoAspect,
++    audio_duration: float,
++    max_clip_duration: int,
++    material_directory: str,
++) -> List[str]:
++    """Render local h3 clips until they cover the narration, then stop.
++
++    Same shape as the paid generative loops so the pipeline behaves
++    identically, with two deliberate differences. Nothing is downloaded --
++    ``generate_videos`` already wrote the file -- and a failure on one search
++    term is logged and skipped instead of aborting the run, because no clip
++    costs anything and a partial set still makes a video.
++    """
++    video_paths: List[str] = []
++    material_sources: list[dict[str, Any]] = []
++
++    try:
++        required_duration = float(audio_duration)
++    except (TypeError, ValueError) as exc:
++        raise h3_local.H3LocalError("h3 audio duration must be a finite number") from exc
++    if not math.isfinite(required_duration):
++        raise h3_local.H3LocalError("h3 audio duration must be a finite number")
++    if required_duration <= 0:
++        logger.warning(
++            f"skip h3 generation because required audio duration is not positive: "
++            f"duration={required_duration}"
++        )
++        _persist_material_sources(task_id, material_sources)
++        return video_paths
++
++    try:
++        clip_duration = int(max_clip_duration)
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise h3_local.H3LocalError("h3 clip duration must be a positive integer") from exc
++    if clip_duration <= 0:
++        raise h3_local.H3LocalError("h3 clip duration must be a positive integer")
++
++    output_dir = material_directory or utils.storage_dir("cache_videos", create=True)
++    total_duration = 0.0
++    for index, search_term in enumerate(search_terms):
++        try:
++            video_items = h3_local.generate_videos(
++                search_term=search_term,
++                minimum_duration=clip_duration,
++                video_aspect=video_aspect,
++                output_dir=output_dir,
++                # A fixed seed would give every term of every task the same
++                # framing; deriving it from the position keeps runs repeatable
++                # while still varying the shot.
++                seed=42 + index,
++            )
++        except h3_local.H3LocalError as exc:
++            logger.error(f"h3 generation failed for '{search_term}': {exc}")
++            continue
++
++        for item in video_items:
++            if not os.path.exists(item.url) or os.path.getsize(item.url) == 0:
++                logger.error(f"h3 reported a clip that is not on disk: {item.url}")
++                continue
++            logger.info(f"video saved: {item.url}")
++            video_paths.append(item.url)
++            try:
++                material_sources.append(_material_source_record(item, item.url))
++            except Exception as source_error:
++                logger.warning(
++                    "failed to prepare generated material source record: "
++                    f"provider=h3_local, error={type(source_error).__name__}, "
++                    f"detail={source_error}"
++                )
++            total_duration += min(clip_duration, item.duration)
++            if total_duration >= required_duration:
++                break
++        if total_duration >= required_duration:
++            logger.info(
++                "generated h3 materials cover the required duration: "
++                f"generated={total_duration:.1f}s, required={required_duration:.1f}s"
++            )
++            break
++
++    if not video_paths:
++        raise h3_local.H3LocalError(
++            "h3 produced no usable clips for any search term"
++        )
++    logger.success(f"generated {len(video_paths)} local h3 videos")
++    _persist_material_sources(task_id, material_sources)
++    return video_paths
++
++
+ def _download_videos_seedance_on_demand(
+     *,
+     task_id: str,
+diff --git a/app/services/task.py b/app/services/task.py
+index 89fe5e7..59193ce 100644
+--- a/app/services/task.py
++++ b/app/services/task.py
+@@ -18,6 +18,7 @@ from app.models.schema import VideoConcatMode, VideoParams
+ from app.services import bgm as bgm_service
+ from app.services import (
+     elevenlabs_music,
++    h3_local,
+     llm,
+     loomloom,
+     material,
+@@ -1361,6 +1362,17 @@ def _run_pipeline(
+     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
+     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
+ 
++    if (
++        stop_at in {"materials", "video"}
++        and params.video_source == "h3_local"
++        and not h3_local.is_configured()
++    ):
++        return _mark_task_failed(
++            task_id,
++            "preflight",
++            "Local h3 generation requires h3_local_binary to point at a built h3",
++        )
++
+     if (
+         stop_at in {"materials", "video"}
+         and params.video_source == "volcengine_seedance"
+diff --git a/config.example.toml b/config.example.toml
+index 5cca1b2..bc04049 100644
+--- a/config.example.toml
++++ b/config.example.toml
+@@ -63,6 +63,26 @@ tls_verify = true
+ # -----------------------------------------------------------------------------
+ 
+ # Available values: "pexels", "pixabay", "coverr", "wavespeed",
++    ########## 本机 h3 视频生成 (MiniMax-H3 on your own GPU) ##########
++    # 与 metaso_minimax 相同的模型，改在本机运行：不按条计费，失败可以直接重试。
++    # 需要先编译 github.com/KaedeTai/h3.c 并准备好模型目录。
++    # h3 可执行文件的绝对路径；留空表示不启用该来源
++    h3_local_binary = ""
++    # 模型目录，相对于 h3 可执行文件所在目录
++    h3_local_model_dir = "./MiniMax-H3-turbo-int8"
++    # 去噪步数。官方 turbo 蒸馏在 3 步即可用，6 步更细但时间翻倍
++    h3_local_steps = 3
++    # 单段时长上下限（秒）。实际帧数会对齐到 h3 的合法帧长 5+17k
++    h3_local_min_duration = 3
++    h3_local_max_duration = 10
++    # 画布覆盖，例如 "608x352"。留空则按画幅自动选择，两边必须是 32 的倍数
++    h3_local_resolution = ""
++    # 提示词模板，{term} 会被替换成搜索关键词。用英文书写：
++    # 中文会被模型读成台词，英文只影响画面
++    h3_local_prompt_template = ""
++    # 单段生成的超时（秒）
++    h3_local_run_timeout = 900
++
+ # "volcengine_seedance", "ofox", "metaso_minimax", "loomloom",
+ # "openai_image", "local".
+ # "wavespeed" generates brand-new clips with WaveSpeed AI text-to-video models
+@@ -72,6 +92,9 @@ tls_verify = true
+ # "ofox" generates brand-new clips through the OFox multi-model video API
+ # (Seedance / Wan and other text-to-video models behind one key); generation
+ # is billed per submitted clip.
++# "h3_local" runs MiniMax-H3 on this machine through the h3.c binary: the
++# same model "metaso_minimax" reaches over the network, with no per-clip
++# charge, so a failed clip is simply retried. See [app] h3_local_* above.
+ # "openai_image" generates one image per script keyword through any
+ # OpenAI-compatible /images/generations endpoint (local ComfyUI/SD gateways
+ # or cloud relays) and renders it into a video clip.
+diff --git a/webui/Main.py b/webui/Main.py
+index db68db0..ecec52f 100644
+--- a/webui/Main.py
++++ b/webui/Main.py
+@@ -116,6 +116,7 @@ LOOMLOOM_MAX_POLL_FAILURES = 5
+ VIDEO_SOURCE_GROUPS = {
+     "stock_video": ("pexels", "pixabay", "coverr"),
+     "ai_video": (
++        "h3_local",
+         "metaso_minimax",
+         "ofox",
+         "loomloom",
