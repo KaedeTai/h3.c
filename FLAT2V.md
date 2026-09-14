@@ -39,6 +39,30 @@ the first in one resident process, against 417 s unaccelerated.
 
 ## Sharp edges
 
+**Attention is not bandwidth-bound, and a bigger Q tile does not help.** The
+DiT's attention runs at 36-46 TFLOP/s against 94 TFLOP/s for the linear layers,
+and it is 60% of the denoise, so it is the obvious thing to attack. The obvious
+theory is traffic: MLX's steel kernel uses a 64-row Q tile, every tile re-reads
+the whole of K and V, and at 158 frames that is 246 passes over 451 MB per
+layer -- 5,550 GB per step, which at 614 GB/s is 9.04 s against a measured
+9.67 s. 94% of the roofline looks like proof.
+
+It is not. Doubling the Q tile to 128 halves that traffic and should nearly
+halve the time. Instantiating the kernel at BQ=128 with eight simdgroups rather
+than four -- which keeps `TQ == 1`, so registers per thread are unchanged --
+makes it **slower at every length**: 28.1 s to 30.0 s at 107 frames, 51.9 to
+52.8 at 158, 63.8 to 69.4 at 175. The agreement with the roofline was a
+coincidence. Concurrent threadgroups work on the same head's K and V, the cache
+hierarchy already coalesces the re-reads, and the DRAM traffic was never 246
+full passes.
+
+Two things follow. Quantising K/V to int8 will not buy the ~2x that the
+bandwidth story predicted, because bytes are not the constraint. And the
+remaining suspect is the shape of attention's matmuls rather than their size:
+`QK^T` reduces over D = 128 and `PV` over BK = 32, where fc1 and fc2 reduce over
+5376 and 14336. Short reductions amortise the matrix-unit setup badly. If that
+is right the lever is BK, not BQ, and it is untested.
+
 **`H3_VAE_INT8_FFN=1` is not a nicety — without it the decoder costs more than
 the whole DiT.** It is in the recipe above and it is the easiest line to drop
 when writing a command by hand. Same clip both ways, 243 frames at 608×352,
