@@ -594,54 +594,70 @@ static int run_block(vae_context *vae, int index, char *error,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
 } while (0)
-    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm1,
-        rows, HIDDEN, 1e-5f), "video VAE attention norm");
+    if (!vae->bf16_mlp)
+        OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden,
+            weight->norm1, rows, HIDDEN, 1e-5f), "video VAE attention norm");
+    else
+        /* Normalise straight into BF16: the only consumer is the BF16 QKV
+         * projection, and the kernel caches the row so it reads it once. */
+        OP(h3_gpu_rms_norm_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->hidden,
+            weight->norm1, rows, HIDDEN, 1e-5f),
+           "video VAE attention norm (BF16 out)");
     if (vae->bf16_mlp) {
-        /* QKV projection in BF16; the fused QK-norm/RoPE kernel is F32-only,
-         * so the packed QKV is cast back before it. */
-        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
-            rows * HIDDEN), "video VAE QKV input cast");
+        /* QKV projection, QK-norm/RoPE and attention all in BF16. The RoPE
+         * kernel used to be F32-only, so the packed QKV was widened before it
+         * and Q, K and V were narrowed again straight after -- four casts a
+         * block, 0.39 ms of the 0.99 ms that step cost, for values that were
+         * BF16 on both sides of the trip. The fused kernel reads and writes
+         * BF16 and reduces the two RMS sums once per (row, head) instead of
+         * once per lane: 0.15 ms against 0.99 ms. The tree sum rounds
+         * differently from the old per-lane sequential one, so the clip is
+         * not bit-identical -- 41.4 dB PSNR, where swapping the attention
+         * kernel for MLX steel costs 19.3 dB. */
         OP(h3_gpu_linear_bf16(vae->gpu, vae->qkv_bf16, vae->norm_bf16,
             weight->qkv_w_bf16, (weight->qkv_b_bf16), rows, HIDDEN, INNER * 3),
            "video VAE QKV (BF16)");
-        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->qkv, vae->qkv_bf16,
-            rows * INNER * 3), "video VAE QKV output cast");
-    } else
-    OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
-        weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
-    OP(h3_gpu_video_qkv_rope_f32(vae->gpu, vae->query, vae->key, vae->value,
-        vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
-        ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
-    if (vae->bf16_mlp) {
-        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->query_bf16, vae->query,
-            rows * INNER), "video VAE query cast");
-        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->key_bf16, vae->key,
-            rows * INNER), "video VAE key cast");
-        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->value_bf16, vae->value,
-            rows * INNER), "video VAE value cast");
+        OP(h3_gpu_video_qkv_rope_bf16(vae->gpu, vae->query_bf16, vae->key_bf16,
+            vae->value_bf16, vae->qkv_bf16, vae->rope_cos, vae->rope_sin,
+            rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "video VAE QK norm/RoPE (BF16)");
         OP(h3_gpu_sdpa_bf16(vae->gpu, vae->heads_bf16, vae->query_bf16,
             vae->key_bf16, vae->value_bf16, rows, HEADS, HEAD_DIM,
             1.0f / sqrtf((float)HEAD_DIM)), "video VAE attention (BF16)");
-    } else
-    OP(h3_gpu_sdpa_f32(vae->gpu, vae->heads, vae->query, vae->key, vae->value,
-        rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-       "video VAE attention");
+    } else {
+        OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
+            weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
+        OP(h3_gpu_video_qkv_rope_f32(vae->gpu, vae->query, vae->key,
+            vae->value, vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS,
+            HEAD_DIM, ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
+        OP(h3_gpu_sdpa_f32(vae->gpu, vae->heads, vae->query, vae->key,
+            vae->value, rows, HEADS, HEAD_DIM,
+            1.0f / sqrtf((float)HEAD_DIM)), "video VAE attention");
+    }
     if (vae->bf16_mlp) {
         OP(h3_gpu_linear_bf16(vae->gpu, vae->branch_bf16, vae->heads_bf16,
             weight->out_w_bf16, (weight->out_b_bf16), rows, INNER, HIDDEN),
            "video VAE attention output (BF16)");
-        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->branch, vae->branch_bf16,
-            rows * HIDDEN), "video VAE attention output cast back");
-    } else
-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
-        weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
-    OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
-        weight->scale1, rows, HIDDEN), "video VAE attention residual");
-    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
-        rows, HIDDEN, 1e-5f), "video VAE MLP norm");
+        /* The residual reads the BF16 branch directly. The stream it
+         * accumulates into stays F32 -- 36 blocks deep is where the extra
+         * mantissa earns its bandwidth. */
+        OP(h3_gpu_scale_add_bf16_branch(vae->gpu, vae->hidden, vae->hidden,
+            vae->branch_bf16, weight->scale1, rows, HIDDEN),
+           "video VAE attention residual");
+        OP(h3_gpu_rms_norm_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->hidden,
+            weight->norm2, rows, HIDDEN, 1e-5f),
+           "video VAE MLP norm (BF16 out)");
+    } else {
+        OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
+            weight->out_b, rows, INNER, HIDDEN),
+           "video VAE attention output");
+        OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden,
+            vae->branch, weight->scale1, rows, HIDDEN),
+           "video VAE attention residual");
+        OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden,
+            weight->norm2, rows, HIDDEN, 1e-5f), "video VAE MLP norm");
+    }
     if (vae->int8_ffn) {
-        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
-            rows * HIDDEN), "video VAE MLP input cast");
         OP(h3_gpu_linear_int8_bf16(vae->gpu, vae->ff1_bf16,
             vae->int8_activation, vae->int8_scales, vae->norm_bf16,
             weight->w1_int8, weight->w1_scales, rows, HIDDEN, FFN * 2, 0),
@@ -655,11 +671,7 @@ static int run_block(vae_context *vae, int index, char *error,
            "video VAE MLP output (int8)");
         OP(h3_gpu_bias_add_bf16(vae->gpu, vae->branch_bf16, vae->branch_bf16,
             weight->w2_b_bf16, rows, HIDDEN), "video VAE MLP output bias");
-        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->branch, vae->branch_bf16,
-            rows * HIDDEN), "video VAE MLP output cast");
     } else if (vae->bf16_mlp) {
-        OP(h3_gpu_cast_f32_to_bf16(vae->gpu, vae->norm_bf16, vae->norm,
-            rows * HIDDEN), "video VAE MLP input cast");
         OP(h3_gpu_linear_bf16(vae->gpu, vae->ff1_bf16, vae->norm_bf16,
             weight->w1_bf16, (weight->w1_b_bf16), rows, HIDDEN, FFN * 2),
            "video VAE MLP input (BF16)");
@@ -668,8 +680,6 @@ static int run_block(vae_context *vae, int index, char *error,
         OP(h3_gpu_linear_bf16(vae->gpu, vae->branch_bf16, vae->activated_bf16,
             weight->w2_bf16, (weight->w2_b_bf16), rows, FFN, HIDDEN),
            "video VAE MLP output (BF16)");
-        OP(h3_gpu_cast_bf16_to_f32(vae->gpu, vae->branch, vae->branch_bf16,
-            rows * HIDDEN), "video VAE MLP output cast");
     } else {
     OP(h3_gpu_linear_f32(vae->gpu, vae->ff1, vae->norm, weight->w1,
         weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
@@ -678,8 +688,14 @@ static int run_block(vae_context *vae, int index, char *error,
     OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->activated, weight->w2,
         weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
     }
-    OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
-        weight->scale2, rows, HIDDEN), "video VAE MLP residual");
+    if (vae->bf16_mlp)
+        OP(h3_gpu_scale_add_bf16_branch(vae->gpu, vae->hidden, vae->hidden,
+            vae->branch_bf16, weight->scale2, rows, HIDDEN),
+           "video VAE MLP residual");
+    else
+        OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden,
+            vae->branch, weight->scale2, rows, HIDDEN),
+           "video VAE MLP residual");
 #undef OP
     return 1;
 }
@@ -1332,6 +1348,14 @@ static int decode_chunked(const char *weight_directory,
         fail(error, error_size, "out of memory retaining decoded video frames");
         ok = 0;
     }
+    /* H3_PROFILE: the decoder's profile line shows ~1.4 s of wall that is
+     * neither GPU wait nor command encoding -- CPU work with the GPU idle.
+     * These counters say which of extract / upload / run / unpack / stitch it
+     * is, which decides whether double-buffering the tiles is worth a second
+     * set of 16 GiB activations. */
+    int profile = getenv("H3_PROFILE") != NULL;
+    double spent_extract = 0, spent_upload = 0, spent_run = 0,
+           spent_unpack = 0, spent_rest = 0, mark = profile ? vae_now() : 0.0;
     for (int chunk = 0; chunk < chunks && ok; chunk++) {
         float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
         if (!tiles) {
@@ -1351,15 +1375,19 @@ static int decode_chunked(const char *weight_directory,
                     ok = 0;
                     break;
                 }
+                if (profile) { spent_extract += vae_now() - mark; mark = vae_now(); }
                 free_tensor(&vae.latent);
                 ok = prepare_input(&vae, input, latent_mean, latent_std,
-                                   error, error_size) &&
-                     run_resident_tile(&vae, error, error_size);
+                                   error, error_size);
+                if (profile) { spent_upload += vae_now() - mark; mark = vae_now(); }
+                ok = ok && run_resident_tile(&vae, error, error_size);
+                if (profile) { spent_run += vae_now() - mark; mark = vae_now(); }
                 free(input);
                 if (!ok) break;
                 h3_video_frames tile;
                 memset(&tile, 0, sizeof(tile));
                 ok = unpack_frames(&vae, &tile, error, error_size);
+                if (profile) { spent_unpack += vae_now() - mark; mark = vae_now(); }
                 if (ok) {
                     int index = tile_y * x_axis.count + tile_x;
                     tiles[index] = tile.rgb;
@@ -1398,6 +1426,13 @@ static int decode_chunked(const char *weight_directory,
         output->rgb = final_rgb;
         final_rgb = NULL;
         ok = h3_gpu_get_stats(vae.gpu, &output->gpu_stats);
+    }
+    if (profile) {
+        spent_rest += vae_now() - mark;
+        fprintf(stderr, "h3: video VAE decode CPU/GPU split: extract=%.3fs "
+                "upload=%.3fs run=%.3fs unpack=%.3fs stitch+blend=%.3fs\n",
+                spent_extract, spent_upload, spent_run, spent_unpack,
+                spent_rest);
     }
     free(final_rgb);
     free(temporal_overlap);

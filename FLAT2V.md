@@ -1018,3 +1018,119 @@ REPL**, where the decoder cache is enabled. So the fault is in the uncached
 single-chunk decoder path, 22 frames being the first chunk on its own. Nothing
 in production asks for a 0.92-second clip, so this is recorded rather than
 fixed; the worker never takes that path.
+
+---
+
+## The video VAE decode, and four hypotheses that died on the way
+
+The decode had never been optimised, and the obvious story was that it was
+dispatch-bound: 22,648 dispatches for one ten-second clip against the DiT's
+1,314. That story was wrong, and so were the next three.
+
+### The measurement first
+
+M5 Max, T2VA, 320×576, 243 frames, 3 steps, `H3_VAE_INT8_FFN=1
+--use-int8-row-fc2`, no resident worker. `H3_SKIP_ATTN=1` gives the
+attention share of each stage by subtraction:
+
+| stage | seconds | note |
+| :--- | ---: | :--- |
+| text encode | 3.5 | |
+| DiT load | 9.1 | the resident worker removes this |
+| DiT denoise — attention | 18.8 | 55% of the denoise |
+| DiT denoise — everything else | 15.3 | |
+| video VAE decode | 10.1 | 8.5 s of it GPU |
+| audio VAE + mux | 0.5 | |
+
+Attention in the DiT is the largest single item in the whole pipeline. The
+video VAE is second.
+
+### Four things that looked like wins and were not
+
+**One tile instead of two.** `configured_tile_pixels` splits a 320×576 frame
+into two 320-pixel tiles with 64 px of overlap, so 11% of the rows are decoded
+twice; raising the `H3_VAE_TILE_PIXELS` ceiling to cover the frame in one tile
+halves the dispatch count. It was **slower**: 10.27 s against 9.75 s. Attention
+is quadratic in the tile's sequence, and one 5,045-row tile does 62% more of it
+than two 2,805-row tiles — almost exactly cancelling the overlap the tiling
+wastes. The tiling is already at its optimum and the dispatch count was never
+the problem.
+
+**Overlapping the CPU with the GPU.** The decoder's profile line shows ~1.4 s
+of wall that is neither GPU wait nor command encoding, which reads like CPU
+work with the GPU idle and argues for double-buffering the tiles. Timing the
+four phases says otherwise: **extract 0.065 s, upload 0.003 s, run 7.6 s,
+unpack 0.082 s, stitch 0.005 s**. The CPU around the loop costs 0.15 s in
+total; the missing 1.4 s is the per-call weight load and int8 prep, which is
+what the resident worker already removes. A second set of 16 GiB activations
+would buy nothing.
+
+**Routing the VAE's BF16 linears onto the NAX kernels.** `h3_gpu_linear_bf16`
+takes the TensorOps path only for shapes `naxShape` lists — under the default
+`H3_NAX=qkv-attn` that is the two DiT shapes — and only when the call carries
+no bias. The VAE's QKV and attention-output projections fail both tests and
+land on MPSGraph, which is what `linear=1022` counts in the profile. A first
+benchmark said MPSGraph was 20% behind, so this looked like free money. It was
+a measurement bug: the benchmark submitted one command buffer per call, and
+that round trip is ~0.25 ms against a 1.6 ms matmul. Batching the calls into
+one command buffer the way a real block does gives **MPSGraph 59.7–63.2
+TFLOP/s against the NAX kernel's 60.1–63.8** — a wash. MPSGraph is already at
+the BF16 ceiling for these shapes. (The same bug had inflated every number in
+the first glue benchmark by 2–4×; both files now batch.)
+
+**MLX steel attention.** Measured through the pipeline, `H3_STEEL_ATTN=1`
+looked 11–18% slower on the DiT — four runs, consistently. It is not: timed on
+its own, alternating in one process, steel and MPSGraph are **184 vs 179 ms and
+170 vs 174 ms** at the DiT's 14282×56×128, and equal at the VAE's
+2805×32×64. The pipeline difference was thermal drift, and the steel runs kept
+landing second in each pair. KaedeStudio's `h3LocalSteelAttention` default is
+fine either way. Attention runs at 32–34 TFLOP/s in both, about half the 65
+TFLOP/s the BF16 matmul kernels reach, and that is structural: QK^T reduces
+over D=128 and PV over the K tile, and the matrix units need a deep reduction
+(see *bench_qk*).
+
+### What actually worked: the RoPE kernel and eight casts
+
+`h3_video_qkv_rope_f32` gave every one of the head_dim threads in a (row, head)
+its own copy of the two RMS reductions, so each lane walked the same 2×64 span
+— 64× more loads than the data needs. It was the slowest thing in a block that
+is otherwise matmul. And because it was F32-only, the BF16 QKV was widened
+before it and Q, K and V narrowed straight after: four casts a block for values
+that were BF16 on both sides.
+
+One kernel fixes both. `h3_video_qkv_rope_bf16` reads and writes BF16 and
+reduces once per (row, head) across its threadgroup's lanes:
+
+| per block, 2805 rows | before | after |
+| :--- | ---: | ---: |
+| RoPE | 0.606 ms | 0.153 ms |
+| QKV cast back (3× wide) | 0.188 ms | — |
+| Q, K, V casts | 0.198 ms | — |
+| **total** | **0.992 ms** | **0.153 ms** |
+
+The other four casts went the same way: `h3_rms_norm_f32_to_bf16` normalises
+straight into the BF16 the projection wants (and caches the row in threadgroup
+memory, so it reads device memory once instead of twice — 103 MB a call down to
+34 MB), and `h3_scale_add_bf16_branch` lets the residual read the BF16 branch
+instead of widening it into scratch first. The residual stream itself stays
+F32: 36 blocks of accumulation is where the extra mantissa earns its bandwidth.
+
+| | dispatches | GPU | wall |
+| :--- | ---: | ---: | ---: |
+| before | 19,596 | 8.475 s | 10.10 s |
+| + BF16 RoPE | 15,564 | 7.571 s | 9.25 s |
+| + the other four casts | 11,532 | **7.238 s** | **8.87 s** |
+
+**1.17× on the decode**, and the same code serves the resident worker's decoder
+because both paths share `run_block`.
+
+On numerics: removing the four casts around the residual and the norms is
+**bit-identical** — the same clip decodes to `PSNR = inf`. The RoPE change is
+not, and the reason is the reduction rather than the BF16: a tree sum and a
+per-lane sequential sum of the same 64 squares round differently in the last
+bits, which moves the RMS scale. That costs **41.4 dB PSNR** against the old
+decode. For scale, swapping the attention kernel between MPSGraph and MLX steel
+— two implementations this project treats as interchangeable — costs **19.3
+dB**, because that one perturbs the denoise and diffusion amplifies it. The
+decode is feed-forward, so 41.4 dB is the drift itself, and the tree sum is the
+more accurate of the two summations.

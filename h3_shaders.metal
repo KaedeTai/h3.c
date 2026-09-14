@@ -241,6 +241,48 @@ kernel void h3_rms_norm_f32(device const float *input [[buffer(0)]],
         output[row * args.width + column] = x[column] * inverse * weight[column];
 }
 
+/* RMS norm that keeps the row and hands the result to a BF16 matmul.
+ *
+ * The video VAE normalises in F32 and then casts the result to BF16 for the
+ * projection that follows, so every block read the row from device memory
+ * twice (once to sum, once to scale) and then read the F32 result back to
+ * narrow it. Caching the row in threadgroup memory and writing BF16 directly
+ * takes that from 103 MB a call to 34 MB. Rows wider than H3_RMS_CACHE_WIDTH
+ * fall back to the F32 kernel plus a cast; the caller checks. */
+#define H3_RMS_CACHE_WIDTH 4096
+
+kernel void h3_rms_norm_f32_to_bf16(device const float *input [[buffer(0)]],
+                                    device const float *weight [[buffer(1)]],
+                                    device bfloat *output [[buffer(2)]],
+                                    constant norm_args &args [[buffer(3)]],
+                                    uint3 group [[threadgroup_position_in_grid]],
+                                    uint3 thread_position [[thread_position_in_threadgroup]],
+                                    uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows || args.width > H3_RMS_CACHE_WIDTH) return;
+    threadgroup float cached[H3_RMS_CACHE_WIDTH];
+    threadgroup float reductions[256];
+    device const float *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
+        float value = x[k];
+        cached[k] = value;
+        local_sum = fma(value, value, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads)
+        output[row * args.width + column] =
+            bfloat(cached[column] * inverse * weight[column]);
+}
+
 struct scale_add_args { uint rows; uint width; };
 
 kernel void h3_scale_add_f32(device const float *residual [[buffer(0)]],
@@ -254,6 +296,24 @@ kernel void h3_scale_add_f32(device const float *residual [[buffer(0)]],
     if (row >= args.rows || column >= args.width) return;
     uint index = row * args.width + column;
     output[index] = residual[index] + branch[index] * scale[column];
+}
+
+/* The residual add, taking a BF16 branch. Everything that produces a branch in
+ * the video VAE produces BF16, and the F32 kernel made each block widen it
+ * into a scratch buffer first: 115 MB a call against 58 MB here. The residual
+ * stream itself stays F32, because 36 blocks of accumulation is exactly where
+ * the extra mantissa is worth its bandwidth. */
+kernel void h3_scale_add_bf16_branch(device const float *residual [[buffer(0)]],
+                                     device const bfloat *branch [[buffer(1)]],
+                                     device const float *scale [[buffer(2)]],
+                                     device float *output [[buffer(3)]],
+                                     constant scale_add_args &args [[buffer(4)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint index = row * args.width + column;
+    output[index] = residual[index] + float(branch[index]) * scale[column];
 }
 
 kernel void h3_layer_norm_f32(device const float *input [[buffer(0)]],
@@ -342,6 +402,97 @@ kernel void h3_video_qkv_rope_f32(
     uint output_index = (row * args.heads + head) * args.head_dim + dimension;
     query[output_index] = q0;
     key[output_index] = k0;
+    value[output_index] = qkv[base + args.head_dim * 2 + dimension];
+}
+
+/* The video VAE's QK-norm + RoPE, in BF16 and without the redundant sums.
+ *
+ * h3_video_qkv_rope_f32 gives every (row, head, dimension) thread its own copy
+ * of the two RMS reductions, so each of the head_dim threads walks the same
+ * 2 x head_dim span: 64x more loads than the data needs, and at 2805 rows it
+ * was the slowest thing in a block that is mostly matmul (0.66 ms against
+ * 0.23 ms for the widest cast). Here one threadgroup owns one (row, head) and
+ * reduces once across its lanes.
+ *
+ * It also reads and writes BF16, which is what the caller had anyway: the
+ * projection produces BF16, the old path widened it to F32 to run this kernel,
+ * and attention narrowed it straight back. Four casts a block for nothing.
+ *
+ * Not bit-identical to the F32 kernel, and the reason is the reduction, not
+ * the BF16: a tree sum and a sequential sum of the same 64 squares round
+ * differently, which moves the RMS scale in the last bits. Decoding one clip
+ * both ways gives 41.4 dB PSNR, against 19.3 dB between MPSGraph and MLX
+ * steel attention -- two kernels this project already treats as
+ * interchangeable. The tree sum is also the more accurate of the two.
+ *
+ * head_dim must be a power of two and at most H3_ROPE_MAX_DIM; the caller
+ * checks both and falls back to the F32 kernel otherwise.
+ */
+#define H3_ROPE_MAX_DIM 128
+
+kernel void h3_video_qkv_rope_bf16(
+                            device const bfloat *qkv [[buffer(0)]],
+                            device const float *rope_cos [[buffer(1)]],
+                            device const float *rope_sin [[buffer(2)]],
+                            device bfloat *query [[buffer(3)]],
+                            device bfloat *key [[buffer(4)]],
+                            device bfloat *value [[buffer(5)]],
+                            constant qkv_args &args [[buffer(6)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint head = group.x;
+    uint row = group.y;
+    uint dimension = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (head >= args.heads || row >= args.sequence ||
+        dimension >= args.head_dim) return;
+
+    threadgroup float raw_q[H3_ROPE_MAX_DIM];
+    threadgroup float raw_k[H3_ROPE_MAX_DIM];
+    threadgroup float sum_q[H3_ROPE_MAX_DIM];
+    threadgroup float sum_k[H3_ROPE_MAX_DIM];
+
+    uint base = (row * args.heads + head) * args.head_dim * 3;
+    float q = float(qkv[base + dimension]);
+    float k = float(qkv[base + args.head_dim + dimension]);
+    raw_q[dimension] = q;
+    raw_k[dimension] = k;
+    sum_q[dimension] = q * q;
+    sum_k[dimension] = k * k;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (dimension < stride) {
+            sum_q[dimension] += sum_q[dimension + stride];
+            sum_k[dimension] += sum_k[dimension + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float qi = rsqrt(sum_q[0] / float(args.head_dim) + args.epsilon);
+    float ki = rsqrt(sum_k[0] / float(args.head_dim) + args.epsilon);
+
+    float q0 = raw_q[dimension] * qi;
+    float k0 = raw_k[dimension] * ki;
+    if (dimension < args.rope_half) {
+        uint pair = dimension + args.rope_half;
+        float q1 = raw_q[pair] * qi;
+        float k1 = raw_k[pair] * ki;
+        float c = rope_cos[row * args.rope_half + dimension];
+        float s = rope_sin[row * args.rope_half + dimension];
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2) {
+        uint pair = dimension - args.rope_half;
+        float q1 = raw_q[pair] * qi;
+        float k1 = raw_k[pair] * ki;
+        float c = rope_cos[row * args.rope_half + pair];
+        float s = rope_sin[row * args.rope_half + pair];
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint output_index = (row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = bfloat(q0);
+    key[output_index] = bfloat(k0);
     value[output_index] = qkv[base + args.head_dim * 2 + dimension];
 }
 
