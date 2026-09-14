@@ -56,12 +56,34 @@ coincidence. Concurrent threadgroups work on the same head's K and V, the cache
 hierarchy already coalesces the re-reads, and the DRAM traffic was never 246
 full passes.
 
-Two things follow. Quantising K/V to int8 will not buy the ~2x that the
-bandwidth story predicted, because bytes are not the constraint. And the
-remaining suspect is the shape of attention's matmuls rather than their size:
+So the suspect became the shape of attention's matmuls rather than their size:
 `QK^T` reduces over D = 128 and `PV` over BK = 32, where fc1 and fc2 reduce over
-5376 and 14336. Short reductions amortise the matrix-unit setup badly. If that
-is right the lever is BK, not BQ, and it is untested.
+5376 and 14336. `tests/bench_dtype.c` times both dtypes against one real DiT
+shape while sweeping the reduction depth, and settles it:
+
+| reduction depth K | bf16 | int8 | int8 / bf16 |
+|---|---|---|---|
+| 128 | 53.3 | 47.4 | **0.89x** |
+| 256 | 63.8 | 89.2 | 1.40x |
+| 512 | 64.5 | 107.5 | 1.67x |
+| 1024 | 64.7 | 114.8 | 1.78x |
+| 2048 | 63.1 | **120.1** | 1.90x |
+| 5376 | 63.5 | 114.9 | 1.81x |
+
+**The M5 matrix units do have a native int8 mode worth 1.9x** -- MLX cannot show
+this because its quantized matmul dequantises first, and reports int8 (54) as
+slower than bf16 (61). But the gain needs a deep reduction to pay for the
+per-call activation quantisation, and at K = 128 int8 is *slower* than bf16.
+Attention reduces over 128 and 32. **An int8 attention in the style of
+SageAttention would make this hardware slower, not faster**, which is the
+opposite of the result on Blackwell and worth knowing before anyone tries it.
+
+Short reductions cost bf16 only 16% (53.3 against an asymptote of 63.5), so they
+do not explain the whole gap either: attention measures 36-46 TFLOP/s counting
+only its two matmuls, and the rest is softmax, the online rescaling and the row
+reductions, which are real work this figure does not count. The conclusion is
+that the attention kernel is already close to what bf16 matrix units can do at
+D = 128, and the levers left are elsewhere.
 
 **`H3_VAE_INT8_FFN=1` is not a nicety — without it the decoder costs more than
 the whole DiT.** It is in the recipe above and it is the easiest line to drop
