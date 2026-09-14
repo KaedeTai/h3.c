@@ -970,6 +970,15 @@ short to hide it: 192×128, 22 frames, 2 steps — **22.1 s cold, 8.3 s warm**. 
 worker removes 13.8 s of load and setup; on a ten-second clip that is ~15-19% of
 the wall clock, and on KaedeStudio's six-second dialogue takes it is more.
 
+Ref2VA goes through it too, which is the case KaedeStudio actually renders: a
+3.04 s shot at 320×576, turbo 4 steps, one `--ref-image` and one `--ref-audio`,
+**29.7 s cold and 20.8 s warm**. The fixed cost does not shrink with the clip,
+so the shorter the take the more of it the worker gives back — 30% here. The
+ordered references are cleared and re-sent per job (`!refs clear` first), and a
+job that sends none renders clean, which is the failure mode worth guarding:
+a reference left over from the previous caller's shot would be invisible in the
+logs and obvious only in the picture.
+
 ### What a worker cannot change about itself
 
 `H3_DIT_VARIANT` is read when the DiT path is resolved and `H3_VAE_INT8_FFN`
