@@ -744,6 +744,14 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
 int h3_cli_run(h3_ctx *ctx, const char *model_dir,
                const h3_params *initial, int show,
                int seed_was_given) {
+    /* tools/h3_worker.py keeps one of these alive and drives it down a pipe,
+       waiting for the "Done -> PATH" line after each prompt. libc turns a piped
+       stdout into a 4 KiB block buffer, which would hold that line until some
+       later generation happened to fill the buffer -- the worker would hang and
+       the driver would be back to polling the output directory for a file that
+       may still be half-written. A terminal is line-buffered already, so this
+       only changes the piped case. Progress goes to stderr and flushes itself. */
+    if (!isatty(fileno(stdout))) setvbuf(stdout, NULL, _IOLBF, 0);
     h3_cli_state state;
     memset(&state, 0, sizeof(state));
     state.ctx = ctx;

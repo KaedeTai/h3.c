@@ -16,6 +16,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -121,6 +122,29 @@ def _strip_audio(src: str, dst: str, ffmpeg: str) -> None:
         )
 
 
+def _worker_client(socket_path: str = ""):
+    """The resident worker, if one is listening, else None.
+
+    Deliberately silent about every way this can fail. The worker is an
+    optimisation: a missing tools/h3_worker.py, an unconfigured socket, a
+    server that died overnight -- each of those should cost this clip the 14 s
+    the worker would have saved, and nothing else. Only a job the worker
+    accepts and then fails is allowed to raise.
+    """
+    path = socket_path or os.environ.get("H3_WORKER_SOCKET", "")
+    if not path:
+        return None
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        from h3_worker import H3WorkerClient  # noqa: PLC0415 -- optional by design
+    except ImportError:
+        return None
+    client = H3WorkerClient(path)
+    return client if client.available() else None
+
+
 def render_clip(
     *,
     prompt: str,
@@ -134,12 +158,17 @@ def render_clip(
     model_dir: str = "./MiniMax-H3-turbo-int8",
     timeout: float = 900.0,
     keep_audio: bool = False,
+    worker_socket: str = "",
 ) -> H3Clip:
     """Generate one clip with h3 and return where it landed.
 
-    One process per clip. The model load is 3-8 s against 40-75 s of denoising,
-    so a resident worker would save under 10%; it is worth doing later, but not
-    at the cost of a REPL protocol in the first version of this provider.
+    Two ways to reach h3, and the clip is identical either way. If a worker
+    socket is configured and answering, the job goes to the resident process in
+    tools/h3_worker.py, which has already loaded the weights and keeps the
+    prepared DiT and the video decoder between clips -- measured at about 14 s
+    off a 75 s ten-second clip. If it is not answering, this falls back to one
+    process per clip, which is what every driver in this repo did before the
+    worker existed. Nothing here requires the worker to be running.
     """
     h3_binary = binary or os.environ.get("H3_BINARY", "")
     if not h3_binary:
@@ -171,30 +200,45 @@ def render_clip(
     for stale in ("H3_AUDIO_ANCHOR", "H3_REF2VA_ANCHOR", "H3_REF2VA_ANCHOR_LAST"):
         env.pop(stale, None)
 
-    command = [
-        h3_binary, "-d", model_dir, "-p", prompt, "-o", raw_path,
-        "--width", str(width), "--height", str(height),
-        "--frames", str(frames), "--steps", str(steps),
-        "--seed", str(seed), "--use-int8-row-fc2",
-    ]
-
     started = time.time()
-    try:
-        result = subprocess.run(
-            command, cwd=workdir, env=env, capture_output=True, text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise H3RunnerError(
-            f"h3 did not finish within {timeout:.0f}s for prompt {prompt[:60]!r}"
-        ) from exc
+    client = _worker_client(worker_socket)
+    if client is not None:
+        try:
+            client.render(
+                prompt=prompt, output=raw_path, width=width, height=height,
+                frames=frames, steps=steps, seed=seed, timeout=timeout,
+                binary=h3_binary, model_dir=model_dir, variant="T2VA",
+            )
+        except Exception as exc:  # the worker's own error type is not imported here
+            raise H3RunnerError(f"the h3 worker refused the clip: {exc}") from exc
+    else:
+        command = [
+            h3_binary, "-d", model_dir, "-p", prompt, "-o", raw_path,
+            "--width", str(width), "--height", str(height),
+            "--frames", str(frames), "--steps", str(steps),
+            "--seed", str(seed), "--use-int8-row-fc2",
+        ]
+        try:
+            result = subprocess.run(
+                command, cwd=workdir, env=env, capture_output=True, text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise H3RunnerError(
+                f"h3 did not finish within {timeout:.0f}s for prompt {prompt[:60]!r}"
+            ) from exc
+        if result.returncode != 0:
+            # h3 writes progress and every diagnostic to stderr and only the
+            # transcript to stdout, so a stdout-only tail reports "no output"
+            # for exactly the failures worth reading.
+            noise = (result.stderr or "") + "\n" + (result.stdout or "")
+            tail = [line.strip() for line in noise.replace("\r", "\n").splitlines()
+                    if line.strip()][-3:]
+            raise H3RunnerError(
+                f"h3 exited with {result.returncode}: {' / '.join(tail) or 'no output'}"
+            )
     wall = time.time() - started
 
-    if result.returncode != 0:
-        tail = (result.stdout or "").replace("\r", "\n").strip().splitlines()[-3:]
-        raise H3RunnerError(
-            f"h3 exited with {result.returncode}: {' / '.join(tail) or 'no output'}"
-        )
     if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
         raise H3RunnerError(f"h3 reported success but wrote no video to {raw_path}")
 

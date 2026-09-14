@@ -933,3 +933,79 @@ lose the articulation.
 
 Segment 7 is the case that shows the trade in one place: every take with the
 line was captioned, every take without it was frozen or nearly so.
+
+---
+
+## A resident h3 is worth about ten seconds a clip
+
+Every driver in this repo has spawned its own `h3 -p ...` per clip. Each one
+starts, mmaps the weights, loads the tokenizer and text encoder, builds the
+prepared DiT and the video decoder, denoises, and then frees all of it so the
+next clip can do it again. `tools/h3_worker.py` keeps one process alive instead
+and drives its REPL, which h3 already designed for this: a prompt change
+**rebinds** a cached DiT rather than reloading it, and the video decoder and the
+text embeddings survive alongside it (`!cache` reports all three).
+
+Measured on the M5 Max, T2VA, 320×576, 243 frames (10.125 s), 3 steps,
+`H3_VAE_INT8_FFN=1 --use-int8-row-fc2`, four prompts each rendered twice back to
+back — warm worker first, then a fresh process — so thermal drift lands on both
+halves of every pair:
+
+| pair | resident worker | one process per clip | saved |
+| :--- | ---: | ---: | ---: |
+| 0 | 53.0 s | 72.1 s | +19.1 s |
+| 1 | 55.7 s | 66.5 s | +10.9 s |
+| 2 | 55.2 s | 66.4 s | +11.1 s |
+| 3 | 65.7 s | 67.0 s | +1.3 s |
+| **mean** | **57.4 s** | **68.0 s** | **+10.6 s (1.185×)** |
+
+The mean lands exactly on the 1.18× predicted from the profile, but pair 3 is
+the honest caveat: this machine's run-to-run spread on identical settings is as
+large as the effect, so a single pair proves nothing and only the mean does. An
+earlier attempt that ran the two halves as separate blocks instead of pairs read
+1.10×, which is the same result seen through the noise.
+
+The clean measurement of the fixed cost is a small clip, where denoising is too
+short to hide it: 192×128, 22 frames, 2 steps — **22.1 s cold, 8.3 s warm**. The
+worker removes 13.8 s of load and setup; on a ten-second clip that is ~15-19% of
+the wall clock, and on KaedeStudio's six-second dialogue takes it is more.
+
+### What a worker cannot change about itself
+
+`H3_DIT_VARIANT` is read when the DiT path is resolved and `H3_VAE_INT8_FFN`
+when the VAE loads, and both results are then cached under keys that do not
+mention them. A process that has loaded T2VA can never be asked for FL2VA, and
+one that started without the int8 VAE flag will decode at 69 s instead of 17 s
+for as long as it lives. Those knobs are therefore the *profile*: a job asking
+for a different one stops the child and starts another. Everything else — size,
+frames, steps, seed, reuse, layers, core reuse, token reduction, references,
+frame anchors — is a REPL command and changes per job.
+
+### Protocol notes
+
+* h3's stdout is the transcript and stderr is the progress bar. A **failed**
+  generation prints nothing at all to stdout: the error goes to stderr and the
+  REPL loops. So every job is followed by `!cache`, whose reply line is the
+  fence — whatever arrived before it is this job's entire output, and if no
+  `Done -> ` came with it, the job failed. The fence doubles as the residency
+  check, which is how the table above was verified rather than assumed.
+* The two streams are read by two threads and the failure reaches stderr just
+  as the fence reaches stdout, so reading the diagnostics needs a moment's
+  grace or the caller is told "no diagnostics" for every real failure.
+* `h3_cli.c` now line-buffers a **piped** stdout. libc would otherwise give it
+  a 4 KiB block buffer and hold the `Done ->` line until some later generation
+  happened to fill it; a terminal was already line-buffered, so nothing changes
+  interactively. Without this the worker hangs on every job.
+
+### A bug found on the way: 22 frames, int8 VAE, no REPL
+
+`h3 -p ... --frames 22` with `H3_VAE_INT8_FFN=1` fails at load with
+
+    h3: video VAE MLP weight cast: cast input tensor is absent or too small
+
+39, 56, 90 and 243 frames are all fine, the same 22-frame clip is fine without
+the int8 VAE flag, and — the useful half — it is fine at 22 frames **inside the
+REPL**, where the decoder cache is enabled. So the fault is in the uncached
+single-chunk decoder path, 22 frames being the first chunk on its own. Nothing
+in production asks for a 0.92-second clip, so this is recorded rather than
+fixed; the worker never takes that path.

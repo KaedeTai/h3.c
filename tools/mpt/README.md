@@ -66,8 +66,20 @@ Attention is quadratic in tokens and a bigger canvas also starts drawing
 captions (see `FLAT2V.md`, *Crop to the head, not to the room*), so B-roll has
 no reason to ask for more.
 
-## Not done
+## The resident worker
 
-One process per clip. Model load is 3–8 s against 18–31 s of denoising, so a
-resident worker driven over h3's REPL would save under 10% — worth doing, but
-not worth a protocol in the first version.
+`render_clip` now looks for `$H3_WORKER_SOCKET` first. If a
+`tools/h3_worker.py serve` is listening there the clip goes to the resident
+process, which has already loaded the weights and keeps the prepared DiT and
+the video decoder between clips; if nothing answers it spawns one process for
+that clip exactly as before. Nothing here requires the worker to be running,
+and a worker that dies overnight costs a clip the saving and nothing else.
+
+    python3 ../h3_worker.py serve -b ~/h3.c/h3 -d MiniMax-H3-turbo-int8 &
+    export H3_WORKER_SOCKET=~/.h3/worker.sock
+
+Measured saving on a 10 s clip: 10.6 s of 68.0 s, and 13.8 s of 22.1 s on a
+clip short enough for the fixed cost to show. See `FLAT2V.md`, *A resident h3
+is worth about ten seconds a clip*, for the paired measurement and the spread.
+The worker holds ~10 GiB while it lives and releases the child after 15 idle
+minutes by default.
