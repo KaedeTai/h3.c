@@ -3154,6 +3154,23 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         1.0f, @"BF16 weight to quantize");
 }
 
+/* Benchmark hook. tests/bench_qk.c needs to time the int8 matmul without the
+ * activation quantisation that every real call pays, because a fused attention
+ * kernel would quantise once and reuse. Leaving this on produces garbage
+ * output, so it announces itself the first time it takes effect rather than
+ * silently corrupting a render. */
+static int h3_gpu_bench_skip_int8_quant(void) {
+    static int state = -1;
+    if (state < 0) {
+        state = getenv("H3_BENCH_SKIP_INT8_QUANT") != NULL;
+        if (state)
+            fprintf(stderr, "h3: H3_BENCH_SKIP_INT8_QUANT is set -- int8 "
+                            "activations are NOT quantised and every result "
+                            "below is garbage. Benchmarks only.\n");
+    }
+    return state;
+}
+
 static int h3_gpu_linear_int8_bf16_layout(
                             h3_gpu *opaque, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
@@ -3178,11 +3195,13 @@ static int h3_gpu_linear_int8_bf16_layout(
                              @"int8 linear output") ||
         !h3_gpu_require_command(gpu)) return 0;
     if (headMajorInput) {
-        if (use_slower_uncached_int8_scales || heads * headDim != input_dim ||
+        if (h3_gpu_bench_skip_int8_quant()) { /* benchmark: inputs are already int8 */ }
+        else if (use_slower_uncached_int8_scales || heads * headDim != input_dim ||
             !h3_gpu_quantize_bf16_int8_head_major_rows(
                 opaque, quantized_input, input_scales, input, rows,
                 padded_rows, heads, headDim)) return 0;
-    } else if (!h3_gpu_quantize_bf16_int8_rows(
+    } else if (!h3_gpu_bench_skip_int8_quant() &&
+               !h3_gpu_quantize_bf16_int8_rows(
                    opaque, quantized_input, input_scales, input, rows,
                    padded_rows, input_dim, 1.0f,
                    @"int8 linear input")) return 0;

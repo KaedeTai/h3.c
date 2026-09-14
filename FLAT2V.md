@@ -78,12 +78,41 @@ Attention reduces over 128 and 32. **An int8 attention in the style of
 SageAttention would make this hardware slower, not faster**, which is the
 opposite of the result on Blackwell and worth knowing before anyone tries it.
 
+That first sweep held the output at 21504 columns while varying K, which
+conflated two separate effects, and it took two more benchmarks to separate
+them. `tests/bench_shape.c` sweeps both dimensions and shows int8 losing badly
+whenever the output is narrow -- 0.26x at the 128x128 shape QK^T actually has.
+But every int8 entry point here re-quantises its activations on each call,
+where a fused attention kernel would quantise Q and K once per head and reuse
+them across every tile. `tests/bench_qk.c` times the matmul with that cost
+removed:
+
+| K | N | bf16 | int8 (with quantisation) | int8 (matmul alone) |
+|---|---|---|---|---|
+| 128 | 128 | 45.1 | 10.9 | **49.5 — 1.10x** |
+| 128 | 2048 | 53.4 | 42.9 | 54.8 — 1.03x |
+| 5376 | 128 | 43.6 | 28.4 | **77.0 — 1.76x** |
+| 5376 | 21504 | 63.1 | 119.1 | 120.2 — 1.91x |
+
+**int8 needs a deep reduction, not a wide output.** The wide output is what
+amortises the quantisation pass; the reduction depth is what the matrix units
+care about, because an int8 matmul accumulates in int32 and pays a dequantise
+and rescale when the reduction ends. At K = 5376 that epilogue is noise even
+with a 128-wide output; at K = 128 it is most of the work.
+
+So an int8 attention is worth **10%** on QK^T, which reduces over D = 128, and
+less than nothing on PV, which reduces over BK = 32. SageAttention is a large
+win on Blackwell because the tensor cores themselves double with each narrower
+dtype; here the gain has to be amortised and attention has nothing to amortise
+it over. Writing one would buy a tenth of 35% of the runtime for a real risk to
+the audio-driven mouth. **Not worth doing.**
+
 Short reductions cost bf16 only 16% (53.3 against an asymptote of 63.5), so they
-do not explain the whole gap either: attention measures 36-46 TFLOP/s counting
-only its two matmuls, and the rest is softmax, the online rescaling and the row
-reductions, which are real work this figure does not count. The conclusion is
-that the attention kernel is already close to what bf16 matrix units can do at
-D = 128, and the levers left are elsewhere.
+do not explain attention's 36-46 TFLOP/s either: the rest is softmax, the online
+rescaling and the row reductions, real work the FLOP count ignores. The
+conclusion stands that the attention kernel is already close to what bf16
+matrix units can do at D = 128, and every lever left is elsewhere -- the
+resident worker, the video VAE decode, and the step count.
 
 **`H3_VAE_INT8_FFN=1` is not a nicety — without it the decoder costs more than
 the whole DiT.** It is in the recipe above and it is the easiest line to drop
