@@ -1156,3 +1156,51 @@ decode. For scale, swapping the attention kernel between MPSGraph and MLX steel
 dB**, because that one perturbs the denoise and diffusion amplifies it. The
 decode is feed-forward, so 41.4 dB is the drift itself, and the tree sum is the
 more accurate of the two summations.
+
+---
+
+## You cannot pick a take at low resolution and re-render it high
+
+This is the one fact that decides the shape of a draft-then-finish pipeline, so
+it is worth being blunt about. Same prompt, same seed 42, same 3 steps, same
+73 frames — only the canvas changed:
+
+| | |
+| :--- | :--- |
+| 320×576 | a woman in a lace blouse and a dark apron, bamboo pendant lamps, shelves of boxes behind her |
+| 480×864 | a different woman, straight brown hair and a striped shirt, a cake cabinet and a wall menu behind her |
+
+Not a sharper version of the same shot. A different film. The seed indexes a
+noise tensor whose *shape* is the latent, so changing the canvas changes the
+draw — exactly what the ai-muninn hybrid write-up says in one line: 「換解析度就
+換 latent 形狀、換雜訊、換人」.
+
+So "render many cheap takes, pick one, then render the winner properly" does
+not work. The winner has to be **upscaled** — the picture you chose is the only
+place that picture exists. Real-ESRGAN ×2 on a half-size render is the route
+KaedeStudio already has, measured at 402 s → 143 s for a 15 s 1152×640 shot.
+The generative alternative (re-noise the draft's latent and refine, the way the
+LTX hybrid does at sigma 0.78) would keep the take *and* add detail, but it
+needs a second model with a compatible VAE and there is no Metal path for one.
+
+Both takes above also came back captioned — 85% and 92% of frames — which is
+the canvas-size caption problem from *Crop to the head, not to the room*
+arriving on schedule at 480×864.
+
+## tools/score_takes.py
+
+The three scorers here print tables for a person. A program choosing between N
+seeds of one shot needs an answer, so `score_takes.py` runs all three over a
+batch and emits one JSON document with a verdict and an order.
+
+Two hard disqualifications, because neither is fixable downstream: a burned-in
+subtitle above 5% of sampled frames, and a frozen take. Freeze is mean |delta|
+between frames sampled at 6 fps on a forced 128×128 square, calibrated against
+a still encoded as video (0.000) and four real takes (5.7–9.7); the floor is
+1.0. Survivors are ranked by lipsync z-score when the shot carries dialogue and
+by *least* motion when it does not, since these are locked-off cameras and
+movement in a silent shot is drift.
+
+The ordering is deliberately not "best score wins": in the first batch it ran
+on, the take with the best lipsync z (2.96 against 0.90) was the one with a
+caption on 85% of its frames. Disqualify first, rank second.
