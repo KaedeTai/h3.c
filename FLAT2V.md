@@ -1108,6 +1108,28 @@ reduces once per (row, head) across its threadgroup's lanes:
 | Q, K, V casts | 0.198 ms | — |
 | **total** | **0.992 ms** | **0.153 ms** |
 
+**Which half of that was BF16?** Almost none of it. Running the same kernel
+three ways separates the dtype from the algorithm:
+
+| RoPE variant, per block | ms |
+| :--- | ---: |
+| F32 in/out, per-lane reduction (the old kernel) | 0.606 |
+| **BF16** in/out, per-lane reduction | 0.563 |
+| **BF16** in/out, threadgroup reduction (shipped) | 0.153 |
+
+BF16 on its own is worth **7%**. The reduction is worth **3.7×**. The kernel
+was never bandwidth-bound — its 64× redundant reads all hit cache, so halving
+the element width halves nothing. Of the 0.839 ms a block actually saved,
+0.410 ms is the reduction, 0.386 ms is the four deleted casts, and 0.043 ms is
+BF16 inside the kernel.
+
+That is the general shape of it here: **BF16 buys bytes, and bytes only pay
+where bytes are genuinely being hauled.** The casts were 100% haulage, so
+deleting them paid in full. `scale_add` runs at 991 GB/s and the casts at
+424–550 GB/s — those are bandwidth-bound and a narrower type helps them
+directly. The RoPE kernel managed 122–227 GB/s, which is the signature of
+something limited by issue rate rather than memory, and it did not care.
+
 The other four casts went the same way: `h3_rms_norm_f32_to_bf16` normalises
 straight into the BF16 the projection wants (and caches the row in threadgroup
 memory, so it reads device memory once instead of twice — 103 MB a call down to
