@@ -23,7 +23,7 @@ because a take that broke it was unusable, not because it scored badly:
 Nothing here is a quality judgement about the acting. It removes takes that
 are broken and orders the rest by the one thing that is measurable.
 
-    score_takes.py [--speech|--silent] [--json OUT] take1.mp4 take2.mp4 ...
+    score_takes.py [--speech|--silent] [--vlm MODEL|--geometry] [--json OUT] take.mp4 ...
 """
 
 from __future__ import annotations
@@ -85,7 +85,8 @@ def _has_audio(path: str) -> bool:
     return bool(probe.stdout.strip())
 
 
-def score_take(path: str, speech: bool | None = None) -> dict:
+def score_take(path: str, speech: bool | None = None,
+               vlm_model: str | None = None) -> dict:
     result = {
         "path": os.path.abspath(path),
         "name": os.path.basename(path),
@@ -103,7 +104,7 @@ def score_take(path: str, speech: bool | None = None) -> dict:
         return result
 
     try:
-        result["subtitle_pct"] = round(subtitle_rate.rate(path), 1)
+        result["subtitle_pct"] = round(subtitle_rate.rate(path, model=vlm_model), 1)
     except Exception as exc:                       # a scorer must not take the batch down
         result["reasons"].append(f"subtitle scorer failed: {exc}")
     try:
@@ -168,11 +169,19 @@ def main(argv: list[str]) -> int:
     if "--silent" in argv:
         argv.remove("--silent")
         speech = False
+    vlm_model = None
+    if "--vlm" in argv:
+        index = argv.index("--vlm")
+        vlm_model = argv[index + 1]
+        del argv[index:index + 2]
+    if "--geometry" in argv:
+        argv.remove("--geometry")
+        vlm_model = ""
     if not argv:
         print(__doc__.strip().splitlines()[-1].strip(), file=sys.stderr)
         return 2
 
-    takes = [score_take(path, speech) for path in argv]
+    takes = [score_take(path, speech, vlm_model) for path in argv]
     wants_speech = speech if speech is not None else any(
         take["lipsync_z"] is not None for take in takes)
     ordered = rank(takes, wants_speech)

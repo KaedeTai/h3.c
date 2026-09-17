@@ -88,7 +88,93 @@ def has_subtitle(mask_frame):
     return best >= ROWS
 
 
-def rate(path, dump=None):
+# ---------------------------------------------------------------- VLM stage
+#
+# The geometry stage below was tuned on ONE kind of material — a white lab coat,
+# head crop, plain wall — and measured on a second it is barely better than
+# chance. On EP3, four checks, four wrong answers:
+#
+#   * a take with a phone, hands and a table in the lower third   -> 69% SUBTITLED
+#   * 蘇知行's yellow 漢服 (the yellow-glyph stage reads cloth)     -> 100% SUBTITLED
+#   * real footage with "只賣一個綠寶幹系" burned across the bottom -> 0%, clean
+#   * real footage with no caption at all                          -> 58% SUBTITLED
+#
+# Both directions, so no threshold rescues it: brightness and flip-count are
+# proxies for text and this material breaks the proxy. A local vision model
+# reads the frame instead of guessing from pixel statistics, costs a few seconds
+# against the ~130 s it takes to render the take being judged, and got all four
+# of those right. Geometry stays as the fallback for when no server answers.
+VLM_URL = os.environ.get("H3_VLM_URL", "http://127.0.0.1:8000/v1/chat/completions")
+VLM_MODEL = os.environ.get("H3_VLM_MODEL", "")
+VLM_KEY = os.environ.get("H3_VLM_KEY", "")
+VLM_SAMPLE = 6
+VLM_PROMPT = ("這是一格影片畫面。畫面上有沒有「燒進畫面的字幕或說明文字」？\n"
+              "招牌、商品包裝、手機介面上本來就有的字不算字幕。\n"
+              "只回一個字：有，或無。")
+
+
+def _ask_vlm(png_path, model, timeout=90):
+    import base64, json as _json, urllib.request
+    with open(png_path, "rb") as handle:
+        blob = base64.b64encode(handle.read()).decode()
+    body = {"model": model, "max_tokens": 8, "temperature": 0, "messages": [{
+        "role": "user", "content": [
+            {"type": "text", "text": VLM_PROMPT},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + blob}}]}]}
+    headers = {"Content-Type": "application/json"}
+    if VLM_KEY:
+        headers["Authorization"] = "Bearer " + VLM_KEY
+    request = urllib.request.Request(VLM_URL, data=_json.dumps(body).encode(), headers=headers)
+    answer = _json.load(urllib.request.urlopen(request, timeout=timeout))
+    return answer["choices"][0]["message"]["content"].strip()
+
+
+def rate_vlm(path, model, samples=VLM_SAMPLE):
+    """Percentage of sampled frames the vision model says carry a caption.
+
+    Raises rather than guessing: the caller decides whether a dead server means
+    "fall back to geometry" or "stop", and a scorer that silently degrades to a
+    method known to be wrong is how a whole draw gets thrown away in silence.
+    """
+    work = tempfile.mkdtemp()
+    try:
+        n = int(subprocess.run(["ffprobe", "-v", "error", "-count_frames",
+                                "-select_streams", "v:0", "-show_entries",
+                                "stream=nb_read_frames", "-of", "csv=p=0", path],
+                               capture_output=True, text=True).stdout.strip() or 0)
+        if not n:
+            return float("nan")
+        step = max(1, n // samples)
+        sel = "+".join(rf"eq(n\,{i})" for i in range(0, n, step))
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path, "-vf",
+                        f"select={sel},scale=448:-1", *_fps_mode_flag(),
+                        f"{work}/%03d.png"], check=True)
+        names = sorted(os.listdir(work))[:samples]
+        hits = 0
+        for name in names:
+            reply = _ask_vlm(os.path.join(work, name), model)
+            # "有" anywhere and "無" absent — small models like to add a period.
+            if "有" in reply and "無" not in reply:
+                hits += 1
+        return 100.0 * hits / max(1, len(names))
+    finally:
+        for name in os.listdir(work):
+            os.unlink(os.path.join(work, name))
+        os.rmdir(work)
+
+
+def rate(path, dump=None, model=None):
+    model = model if model is not None else VLM_MODEL
+    if model:
+        try:
+            return rate_vlm(path, model)
+        except Exception as exc:
+            print(f"[subtitle] 視覺模型沒有回應（{exc}），退回幾何判斷，"
+                  f"這條的字幕判定不可靠", file=sys.stderr)
+    return _rate_geometry(path, dump=dump)
+
+
+def _rate_geometry(path, dump=None):
     work = tempfile.mkdtemp()
     n = int(subprocess.run(["ffprobe", "-v", "error", "-count_frames",
                             "-select_streams", "v:0", "-show_entries",
@@ -122,9 +208,14 @@ def rate(path, dump=None):
 if __name__ == "__main__":
     args = sys.argv[1:]
     dump = None
+    model = None
     if "--dump" in args:
         i = args.index("--dump"); dump = args[i + 1]; del args[i:i + 2]
+    if "--vlm" in args:
+        i = args.index("--vlm"); model = args[i + 1]; del args[i:i + 2]
+    if "--geometry" in args:
+        args.remove("--geometry"); model = ""
     print(f"{'take':30s} {'frames with a subtitle':>23s}")
     for p in args:
-        r = rate(p, dump)
+        r = rate(p, dump, model)
         print(f"{os.path.basename(p):30s} {r:21.0f} %  {'SUBTITLED' if r > 0 else ''}")
