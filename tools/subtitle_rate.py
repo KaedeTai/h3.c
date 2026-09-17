@@ -163,12 +163,28 @@ def rate_vlm(path, model, samples=VLM_SAMPLE):
         os.rmdir(work)
 
 
-def rate(path, dump=None, model=None):
+class VisionUnavailable(Exception):
+    """The vision model was asked for and could not be reached."""
+
+
+def rate(path, dump=None, model=None, fallback=True):
+    """Percentage of sampled frames carrying a burned-in caption.
+
+    `fallback` is the whole decision. At a prompt, falling back to geometry and
+    saying so is friendly. Inside an automated draw it is not: geometry rejected
+    all three EP3 takes over a phone screen and a yellow 漢服, so a mistyped API
+    key silently cost the shot its entire draw and the log said only "全部淘汰".
+    Callers that disqualify on this number pass `fallback=False` and treat the
+    exception as "caption unknown", which screens nothing but throws nothing
+    away either.
+    """
     model = model if model is not None else VLM_MODEL
     if model:
         try:
             return rate_vlm(path, model)
         except Exception as exc:
+            if not fallback:
+                raise VisionUnavailable(str(exc)) from exc
             print(f"[subtitle] 視覺模型沒有回應（{exc}），退回幾何判斷，"
                   f"這條的字幕判定不可靠", file=sys.stderr)
     return _rate_geometry(path, dump=dump)

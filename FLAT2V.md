@@ -1204,3 +1204,37 @@ movement in a silent shot is drift.
 The ordering is deliberately not "best score wins": in the first batch it ran
 on, the take with the best lipsync z (2.96 against 0.90) was the one with a
 caption on 85% of its frames. Disqualify first, rank second.
+
+---
+
+## 字幕偵測器在別的素材上是擲硬幣（2026-09-18）
+
+`subtitle_rate.py` 的幾何判斷是在**一種**素材上調出來的：白袍、頭部特寫、素背景。
+拿 EP3 的素材驗，四支有標籤的片，四個答案全錯：
+
+| 片 | 幾何判斷 | 實際 |
+|---|---|---|
+| 新抽的 s12（手機、手、桌面在下三分之一） | 69% SUBTITLED | 沒有字 |
+| `renders/mega/s02`（蘇知行的黃色漢服） | 100% SUBTITLED | 沒有字 |
+| `wang_wenchin/v_6cMJDbzSgpY`（下方燒著「只賣一個綠寶幹系」） | 0% 乾淨 | **有字** |
+| `wang_wenchin/v_0Vy3kpk_RBI` | 58% SUBTITLED | 沒有字 |
+
+兩個方向都錯，所以調閾值救不了——亮度和 row 的翻轉次數是「文字」的代理變數，
+這批素材把代理變數打破了。`--dump` 的紅色遮罩直接指出來：紅的是手機、手、茶杯，
+以及**黃色漢服**。白袍那次的修法（要求 row 翻轉夠多次）在黃色那一階完全沒被套用。
+
+這件事以前只是不準，現在會吃掉東西：一鍵成片裡這個 disqualifier 會把一鏡的
+**每一條**都淘汰掉，而且畫面上什麼都不會說，那一鏡永遠不會變好。
+
+修法不是再調一次閾值，是讓會讀字的東西去讀：`rate()` 現在把 6 格畫面丟給本機的
+視覺模型問「有沒有燒進畫面的字幕」，同樣四支片 4/4。一條 take 要 130 秒生，
+問六格畫面幾秒鐘，這個交換不用想。
+
+**而且失敗時不准退回幾何判斷。** `score_takes.py` 用 `fallback=False`：視覺模型
+連不上就把 `subtitle_pct` 留成 `None`、在 reasons 裡寫清楚，這一輪不檢查字幕。
+這是實際踩到的——app 的 omlx key 沒設，401，退回幾何，三條全淘汰，
+log 上只有一句「全部淘汰」。少檢查一項，比丟掉一整輪好。
+
+驗收（EP3 s12，7.0 秒台詞）：修好之後 3 條分別 ★4／★5／★3，選中 seed 245290007，
+成片從 100.701 秒變成 104.251 秒（3.75 → 7.30 秒），而且「旁白比畫面長」的名單裡
+**少了這一鏡**——管線自己生的對白鏡長度是從語音量出來的，本來就不會蓋出去。

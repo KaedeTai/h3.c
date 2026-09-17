@@ -104,7 +104,14 @@ def score_take(path: str, speech: bool | None = None,
         return result
 
     try:
-        result["subtitle_pct"] = round(subtitle_rate.rate(path, model=vlm_model), 1)
+        result["subtitle_pct"] = round(
+            subtitle_rate.rate(path, model=vlm_model, fallback=False), 1)
+    except subtitle_rate.VisionUnavailable as exc:
+        # Deliberately NOT the geometric detector: it rejects this material on
+        # a phone screen or a yellow robe, so falling back here would throw the
+        # whole draw away over a bad API key. No caption screening this round,
+        # and the take says so.
+        result["reasons"].append(f"字幕沒檢查（視覺模型沒有回應：{exc}）")
     except Exception as exc:                       # a scorer must not take the batch down
         result["reasons"].append(f"subtitle scorer failed: {exc}")
     try:
