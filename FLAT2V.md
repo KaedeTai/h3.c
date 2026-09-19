@@ -1292,3 +1292,26 @@ Big Impact / # 2025 Total Swiss 澳門大會」
 
 OCR 也留成一個可選的判定方法（`--ocr`），但預設不是它，理由就是上面那張表。
 另外 jina-ocr-v1 是 **CC BY-NC 4.0**，商用要另外談。
+
+### 「OCR 能不能改用 oMLX 跑就好？」——量過，不行（2026-09-19）
+
+方向本身是對的：oMLX 的 VLM engine 認得 `deepseekocr` 與 `deepseekocr_2`，
+mlx-vlm 兩個模組都有。卡住的是 processor 不是架構。
+
+1. jina-ocr-v1 的 config 寫 `model_type: deepseek_vl_v2`，那會路由到 SigLIP 塔的
+   模組然後炸掉。它的 `vision_config` 是 `clip-l-14-224` + `sam_vit_b`
+   （`deeplip_b_l`），那是 DeepSeek-OCR **v1** 的 DeepEncoder——對應 `deepseekocr`。
+2. 改成 `deepseekocr` 之後模型**建得起來**，只差 12 個 `mtp_module.*`（FastMTP
+   推測頭，mlx-vlm 沒有模這塊）。丟掉它們損失約 2× 的推測解碼，不影響輸出內容。
+3. 轉成 MLX 8-bit，**載入 0.5 秒**（PyTorch 路徑是 10 秒）。
+4. 然後它對每一張圖都回同一段幻覺文字，而且 detokenise 漏出 `Ġ` 這種 byte-BPE
+   標記。直接用 mlx-vlm 呼叫、和經過 oMLX 的 VLM engine，結果一樣——所以不是
+   呼叫方式的問題。
+5. 原因：`deepseekocr` 是照 DeepSeek-OCR 的 tokenizer 與 processor 寫的
+   （vocab 102400），jina 有自己的一套（vocab 129280、`processing_deepseek_ocr.py`）。
+
+要讓它成立得在 mlx-vlm 裡寫一個 jina 形狀的模組，不是改個 config。
+轉檔腳本留在 `tools/jina_ocr_to_mlx.py`，下次要做從那裡接手。
+
+順帶一提，常駐 worker 的成本本來就不高：閒置 15 分鐘會自己把模型放掉，而且只有
+在一條 take 已經被判有字幕之後才會被叫到。
