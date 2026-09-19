@@ -20,7 +20,7 @@ rows to make a line of text.
 
     subtitle_rate.py TAKE.mp4 [...] [--dump DIR]
 """
-import os, subprocess, sys, tempfile
+import json, os, re, subprocess, sys, tempfile
 import numpy as np
 from PIL import Image
 from scipy.ndimage import binary_dilation
@@ -157,6 +157,112 @@ def rate_vlm(path, model, samples=VLM_SAMPLE):
             if "有" in reply and "無" not in reply:
                 hits += 1
         return 100.0 * hits / max(1, len(names))
+    finally:
+        for name in os.listdir(work):
+            os.unlink(os.path.join(work, name))
+        os.rmdir(work)
+
+
+# ------------------------------------------------------------------ OCR stage
+#
+# A step past the yes/no question: read the frame and look at what comes back.
+# jina-ocr-v1 answers a fixed "transcribe this document" instruction, and on a
+# frame with no text it does not invent any -- it describes the picture
+# instead, in English, usually grounding the whole frame as one region:
+#
+#   s01  "A single water droplet hanging from a leaf[[0,0,1000,1000]]"
+#   s09  "The image depicts a scene from a film or television show, ..."
+#   w3   "超前一步 / Small Steps / 領先一代 / Big Impact / 2025 Total Swiss 澳門大會"
+#   w8   "# Fit Solution / 人體有70兆細胞細胞或人體健康！ / ## 95.8fm Interview..."
+#
+# So the caption decision is "did it transcribe or did it describe", and the
+# answer carries the words, which the yes/no never did. Knowing a take burned
+# in 「白露秋分夜」 tells you the model is captioning its own dialogue; knowing
+# it burned in a shop sign tells you the reference image did it.
+#
+# NOTE this is MORE sensitive than the yes/no: real signage inside the scene
+# is text, and it is reported. For h3 takes that is the right way round -- the
+# model drawing text at all is usually the defect -- but it means a shot that
+# is meant to contain a sign will always be flagged.
+OCR_SOCKET = os.environ.get("H3_OCR_SOCKET", os.path.expanduser("~/.h3/ocr.sock"))
+OCR_SAMPLE = 6
+# A burned-in caption persists: the geometric detector measured real ones on
+# 69-100% of sampled frames. An OCR hallucination does not -- one frame of the
+# EP3 cut came back "# 2 / *林建中*" where Ornith, asked to look in every
+# corner, found nothing at all. One frame in six is 16.7%, which would clear a
+# 5% bar and cost the take. So this method needs TWO frames to agree.
+OCR_LIMIT = 33.0
+# Phrases the model only uses when it is describing a picture, never when
+# transcribing one. Measured over 27 frames of this project's material.
+_DESCRIBER = (
+    "the image depicts", "the image shows", "the image features",
+    "this image", "appears to be", "is seated", "is sitting", "is standing",
+    "is holding", "is wearing", "hanging from", "in a room", "on stage",
+)
+_BBOX = re.compile(r"\[\[\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\]\]\s*$")
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff]")
+
+
+def looks_like_transcription(text: str) -> bool:
+    """True when the model read words off the frame rather than describing it."""
+    body = _BBOX.sub("", (text or "").strip()).strip()
+    if not body:
+        return False
+    if _CJK.search(body):
+        return True
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    # Markdown structure is the transcriber's own output shape.
+    if any(line.startswith(("#", "|", "$$")) for line in lines):
+        return True
+    lowered = body.lower()
+    if any(phrase in lowered for phrase in _DESCRIBER):
+        return False
+    # What is left: short fragments are signage, long prose is description.
+    return len(body.split()) <= 8
+
+
+def rate_ocr(path, socket_path=None, samples=OCR_SAMPLE):
+    """Percentage of sampled frames carrying burned-in text, and what it said.
+
+    Returns (percentage, [text, ...]) so the caller can put the words in the
+    take's report instead of only a number.
+    """
+    import socket as _socket
+
+    target = os.path.expanduser(socket_path or OCR_SOCKET)
+    work = tempfile.mkdtemp()
+    try:
+        n = int(subprocess.run(["ffprobe", "-v", "error", "-count_frames",
+                                "-select_streams", "v:0", "-show_entries",
+                                "stream=nb_read_frames", "-of", "csv=p=0", path],
+                               capture_output=True, text=True).stdout.strip() or 0)
+        if not n:
+            return float("nan"), []
+        step = max(1, n // samples)
+        sel = "+".join(rf"eq(n\,{i})" for i in range(0, n, step))
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path, "-vf",
+                        f"select={sel},scale=640:-1", *_fps_mode_flag(),
+                        f"{work}/%03d.png"], check=True)
+        frames = [os.path.join(work, name) for name in sorted(os.listdir(work))][:samples]
+        payload = json.dumps({"op": "read", "paths": frames,
+                              "max_new_tokens": 160}).encode("utf-8")
+        connection = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        connection.settimeout(900)
+        connection.connect(target)
+        with connection:
+            connection.sendall(payload + b"\n")
+            buffer = b""
+            while not buffer.endswith(b"\n"):
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                buffer += chunk
+        reply = json.loads(buffer.decode("utf-8"))
+        if not reply.get("ok"):
+            raise VisionUnavailable(reply.get("error", "ocr worker refused"))
+        found = [page["text"] for page in reply["pages"]
+                 if looks_like_transcription(page["text"])]
+        return 100.0 * len(found) / max(1, len(reply["pages"])), found
     finally:
         for name in os.listdir(work):
             os.unlink(os.path.join(work, name))

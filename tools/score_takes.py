@@ -23,7 +23,8 @@ because a take that broke it was unusable, not because it scored badly:
 Nothing here is a quality judgement about the acting. It removes takes that
 are broken and orders the rest by the one thing that is measurable.
 
-    score_takes.py [--speech|--silent] [--vlm MODEL|--geometry] [--json OUT] take.mp4 ...
+    score_takes.py [--speech|--silent] [--ocr|--vlm MODEL|--geometry]
+                   [--ocr-socket PATH] [--json OUT] take.mp4 ...
 """
 
 from __future__ import annotations
@@ -86,11 +87,14 @@ def _has_audio(path: str) -> bool:
 
 
 def score_take(path: str, speech: bool | None = None,
-               vlm_model: str | None = None) -> dict:
+               vlm_model: str | None = None, caption_method: str = "vlm",
+               ocr_socket: str | None = None) -> dict:
     result = {
         "path": os.path.abspath(path),
         "name": os.path.basename(path),
         "subtitle_pct": None,
+        "subtitle_limit": SUBTITLE_LIMIT,
+        "subtitle_text": None,
         "motion": None,
         "lipsync_r": None,
         "lipsync_lag": None,
@@ -104,8 +108,19 @@ def score_take(path: str, speech: bool | None = None,
         return result
 
     try:
-        result["subtitle_pct"] = round(
-            subtitle_rate.rate(path, model=vlm_model, fallback=False), 1)
+        if caption_method == "ocr":
+            # Reads the frame and reports the words, so a rejected take says
+            # WHAT it burned in -- 「白露秋分夜」 means the model is captioning
+            # its own dialogue, a shop sign means the reference image did it.
+            pct, found = subtitle_rate.rate_ocr(path, socket_path=ocr_socket)
+            result["subtitle_pct"] = round(pct, 1)
+            result["subtitle_limit"] = subtitle_rate.OCR_LIMIT
+            if found:
+                first = " / ".join(found[0].split("\n"))[:120]
+                result["subtitle_text"] = first
+        else:
+            result["subtitle_pct"] = round(
+                subtitle_rate.rate(path, model=vlm_model, fallback=False), 1)
     except subtitle_rate.VisionUnavailable as exc:
         # Deliberately NOT the geometric detector: it rejects this material on
         # a phone screen or a yellow robe, so falling back here would throw the
@@ -133,10 +148,29 @@ def score_take(path: str, speech: bool | None = None,
         except Exception as exc:
             result["reasons"].append(f"lipsync scorer failed: {exc}")
 
-    if result["subtitle_pct"] is not None and result["subtitle_pct"] > SUBTITLE_LIMIT:
+    if result["subtitle_pct"] is not None and \
+            result["subtitle_pct"] > result["subtitle_limit"]:
         result["verdict"] = "subtitled"
-        result["reasons"].append(
-            f"{result['subtitle_pct']:.0f}% of frames carry a caption")
+        # Only now, and only for a take already being thrown out, ask the OCR
+        # what the caption SAID. It is not allowed to decide: measured over
+        # four labelled clips it scored 3 of 4, hallucinating fluent Japanese
+        # onto 蘇知行's yellow 漢服 on EVERY sampled frame, which no
+        # persistence rule can catch. But when something is really there it
+        # reads it, and the words are what tell you which fix to make —
+        # 「白露秋分夜」 means the model is captioning its own dialogue and the
+        # prompt has to change; a shop sign means the reference image did it.
+        if caption_method != "ocr" and ocr_socket is not False:
+            try:
+                _, found = subtitle_rate.rate_ocr(
+                    path, socket_path=(ocr_socket or None))
+                if found:
+                    result["subtitle_text"] = " / ".join(found[0].split("\n"))[:120]
+            except Exception:
+                pass    # no reader is a missing explanation, not a failed take
+        reason = f"{result['subtitle_pct']:.0f}% of frames carry a caption"
+        if result.get("subtitle_text"):
+            reason += f"：「{result['subtitle_text']}」"
+        result["reasons"].append(reason)
     elif result["motion"] is not None and result["motion"] < FREEZE_FLOOR:
         result["verdict"] = "frozen"
         result["reasons"].append(
@@ -176,6 +210,19 @@ def main(argv: list[str]) -> int:
     if "--silent" in argv:
         argv.remove("--silent")
         speech = False
+    caption_method = "vlm"
+    ocr_socket = None
+    if "--no-ocr-text" in argv:
+        argv.remove("--no-ocr-text")
+        ocr_socket = False      # do not even try to read the words
+    if "--ocr" in argv:
+        argv.remove("--ocr")
+        caption_method = "ocr"
+    if "--ocr-socket" in argv:
+        index = argv.index("--ocr-socket")
+        ocr_socket = argv[index + 1]
+        caption_method = "ocr"
+        del argv[index:index + 2]
     vlm_model = None
     if "--vlm" in argv:
         index = argv.index("--vlm")
@@ -188,13 +235,15 @@ def main(argv: list[str]) -> int:
         print(__doc__.strip().splitlines()[-1].strip(), file=sys.stderr)
         return 2
 
-    takes = [score_take(path, speech, vlm_model) for path in argv]
+    takes = [score_take(path, speech, vlm_model, caption_method, ocr_socket)
+             for path in argv]
     wants_speech = speech if speech is not None else any(
         take["lipsync_z"] is not None for take in takes)
     ordered = rank(takes, wants_speech)
     document = {
         "speech": wants_speech,
         "subtitle_limit": SUBTITLE_LIMIT,
+        "caption_method": caption_method,
         "freeze_floor": FREEZE_FLOOR,
         "takes": ordered,
         "chosen": next((t["path"] for t in ordered if t["verdict"] == "ok"), None),
