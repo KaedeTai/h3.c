@@ -269,6 +269,86 @@ def rate_ocr(path, socket_path=None, samples=OCR_SAMPLE):
         os.rmdir(work)
 
 
+# ----------------------------------------------------------- noul (logits)
+#
+# Jev's shape, on the model this project already trusts: prefill the frame
+# with the question, then read the softmax over just the two option tokens.
+# Nothing is generated, so the answer cannot turn on whether the model felt
+# like adding a period, and what comes back is a probability instead of a
+# word.
+#
+# Measured on 21 labelled frames of this project's material, with the same
+# question the yes/no method asks: 21/21, lowest "has text" 0.999 against
+# highest "no text" 0.294 — a 0.704 gap — at 0.15-0.33 s a frame against the
+# generated answer's ~2.5 s. It gets right both frames that fooled the OCR
+# (the yellow 漢服 at 0.0006, EP3's cut s12 at 0.0953) and both frames where
+# the generated answer had flipped between wordings.
+#
+# Two things this does NOT do, both measured:
+#
+#   * It does not remove the question's influence. The same frame under three
+#     phrasings moved by up to 0.986 — but those were three different
+#     questions ("any text at all" vs "a subtitle along the bottom"), and the
+#     disagreement is them meaning different things, not instability. The
+#     prompt IS the specification; this only makes the answer to it sharp.
+#   * It does not transfer to a cheaper model. The identical code on
+#     gemma-3-12b-it-4bit scores 3/21 with the classes overlapping (gap
+#     -0.089). Re-measure before swapping the model.
+NOUL_SAMPLE = 6
+# A caption persists; one frame over the line is not one. Same two-of-six bar
+# the OCR method uses, and for the same reason.
+NOUL_LIMIT = 33.0
+NOUL_QUESTION = VLM_PROMPT   # the same question, answered from logits
+
+
+def rate_noul(path, socket_path=None, samples=NOUL_SAMPLE, question=NOUL_QUESTION):
+    """Percentage of sampled frames the model puts over 0.5, and the scores.
+
+    Returns (percentage, [probability, ...]) so the caller can show how sure
+    it was rather than only how many frames crossed a line.
+    """
+    import socket as _socket
+
+    target = os.path.expanduser(socket_path or OCR_SOCKET)
+    work = tempfile.mkdtemp()
+    try:
+        n = int(subprocess.run(["ffprobe", "-v", "error", "-count_frames",
+                                "-select_streams", "v:0", "-show_entries",
+                                "stream=nb_read_frames", "-of", "csv=p=0", path],
+                               capture_output=True, text=True).stdout.strip() or 0)
+        if not n:
+            return float("nan"), []
+        step = max(1, n // samples)
+        sel = "+".join(rf"eq(n\,{i})" for i in range(0, n, step))
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", path, "-vf",
+                        f"select={sel},scale=640:-1", *_fps_mode_flag(),
+                        f"{work}/%03d.png"], check=True)
+        frames = [os.path.join(work, name) for name in sorted(os.listdir(work))][:samples]
+        payload = json.dumps({"op": "noul", "question": question,
+                              "paths": frames}).encode("utf-8")
+        connection = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        connection.settimeout(900)
+        connection.connect(target)
+        with connection:
+            connection.sendall(payload + b"\n")
+            buffer = b""
+            while not buffer.endswith(b"\n"):
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                buffer += chunk
+        reply = json.loads(buffer.decode("utf-8"))
+        if not reply.get("ok"):
+            raise VisionUnavailable(reply.get("error", "decider refused"))
+        scores = [answer["p"] for answer in reply["answers"]]
+        over = [p for p in scores if p > 0.5]
+        return 100.0 * len(over) / max(1, len(scores)), scores
+    finally:
+        for name in os.listdir(work):
+            os.unlink(os.path.join(work, name))
+        os.rmdir(work)
+
+
 class VisionUnavailable(Exception):
     """The vision model was asked for and could not be reached."""
 

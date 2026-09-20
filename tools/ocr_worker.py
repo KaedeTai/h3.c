@@ -25,12 +25,107 @@ import time
 
 DEFAULT_SOCKET = os.path.expanduser("~/.h3/ocr.sock")
 DEFAULT_MODEL = os.path.expanduser("~/models/jina-ocr-v1")
+DEFAULT_DECISION_MODEL = os.path.expanduser("~/models/Ornith-BigBang-MTP-zh-mlx-4bit")
 # The model answers a fixed instruction; the processor supplies it.
 DEFAULT_MAX_TOKENS = 192
 
 
 class OcrWorkerError(RuntimeError):
     pass
+
+
+class Decider:
+    """A typed yes/no read off the logits, Jev's shape.
+
+    The question is prefilled with the frame and nothing is generated: the
+    answer is the softmax over just the two option tokens, so it is one
+    forward pass, it is deterministic, and what comes back is a probability
+    you can threshold rather than a word you have to match.
+
+    Measured on 21 labelled frames of this project's material with the
+    production question: 21/21, lowest "has text" 0.999 against highest
+    "no text" 0.294 — a 0.704 gap, at 0.15-0.33 s a frame against ~2.5 s for
+    the generated answer.
+
+    The MODEL is the whole trick, not the technique. The same code on
+    gemma-3-12b-it-4bit scores 3/21 with the two classes overlapping
+    (gap -0.089). Ornith's Chinese training is doing the work; do not swap
+    this for something cheaper without re-running the measurement.
+    """
+
+    def __init__(self, model_dir: str, yes: str = "有", no: str = "無"):
+        self.model_dir = model_dir
+        self.yes_text, self.no_text = yes, no
+        self._lock = threading.Lock()
+        self._model = None
+        self._processor = None
+        self._prepare = None
+        self._template = None
+        self._mx = None
+        self._yes = self._no = None
+        self.decisions = 0
+        self.loaded_at = 0.0
+        self.last_used = 0.0
+
+    @property
+    def alive(self) -> bool:
+        return self._model is not None
+
+    def load(self) -> None:
+        if self._model is not None:
+            return
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        import mlx.core as mx
+        from mlx_vlm import load, prepare_inputs
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        started = time.time()
+        self._mx = mx
+        self._prepare = prepare_inputs
+        self._template = apply_chat_template
+        self._model, self._processor = load(self.model_dir, trust_remote_code=True)
+        tokenizer = getattr(self._processor, "tokenizer", self._processor)
+        self._yes = tokenizer.encode(self.yes_text, add_special_tokens=False)[0]
+        self._no = tokenizer.encode(self.no_text, add_special_tokens=False)[0]
+        self.loaded_at = time.time()
+        log(f"decider {self.model_dir} on {self.loaded_at - started:.1f}s "
+            f"({self.yes_text}={self._yes} {self.no_text}={self._no})")
+
+    def release(self) -> None:
+        with self._lock:
+            self._model = None
+            self._processor = None
+
+    def probability(self, path: str, question: str) -> float:
+        if not os.path.exists(path):
+            raise OcrWorkerError(f"no such image: {path}")
+        with self._lock:
+            self.load()
+            mx = self._mx
+            formatted = self._template(self._processor, self._model.config,
+                                       question, num_images=1)
+            inputs = self._prepare(
+                self._processor, images=[path], prompts=formatted,
+                image_token_index=getattr(self._model.config, "image_token_index", None))
+            extra = {k: v for k, v in inputs.items()
+                     if k not in ("input_ids", "pixel_values", "attention_mask")}
+            out = self._model(inputs["input_ids"], inputs.get("pixel_values"),
+                              mask=inputs.get("attention_mask"), **extra)
+            logits = out.logits if hasattr(out, "logits") else out
+            last = logits[0, -1]
+            pair = mx.stack([last[self._yes], last[self._no]])
+            probability = float(mx.softmax(pair.astype(mx.float32))[0])
+            self.decisions += 1
+            self.last_used = time.time()
+        return probability
+
+    def status(self) -> dict:
+        return {
+            "alive": self.alive,
+            "decisions": self.decisions,
+            "model": self.model_dir,
+            "idle": round(time.time() - self.last_used, 1) if self.last_used else 0.0,
+        }
 
 
 class Resident:
@@ -125,9 +220,11 @@ def log(message: str) -> None:
 
 
 class Server:
-    def __init__(self, socket_path: str, model_dir: str, device: str, idle_seconds: float):
+    def __init__(self, socket_path: str, model_dir: str, device: str,
+                 idle_seconds: float, decision_model: str = DEFAULT_DECISION_MODEL):
         self.socket_path = socket_path
         self.resident = Resident(model_dir, device)
+        self.decider = Decider(decision_model)
         self.idle_seconds = idle_seconds
         self.served = 0
         self._stopping = threading.Event()
@@ -138,10 +235,26 @@ class Server:
         if op == "ping":
             return {"ok": True, "pong": True}
         if op == "status":
-            return {"ok": True, "served": self.served, "worker": self.resident.status()}
+            return {"ok": True, "served": self.served,
+                    "worker": self.resident.status(),
+                    "decider": self.decider.status()}
         if op == "release":
             self.resident.release()
+            self.decider.release()
             return {"ok": True, "released": True}
+        if op == "noul":
+            paths = request.get("paths") or ([request["path"]] if request.get("path") else [])
+            question = request.get("question")
+            if not paths or not question:
+                return {"ok": False, "error": "noul needs paths and a question"}
+            started = time.time()
+            resident_before = self.decider.alive
+            answers = [{"path": p, "p": round(self.decider.probability(str(p), question), 6)}
+                       for p in paths]
+            log(f"noul {len(answers)} frame(s) in {time.time() - started:.1f}s "
+                f"[{'resident' if resident_before else 'cold'}]")
+            return {"ok": True, "answers": answers, "resident": resident_before,
+                    "seconds": round(time.time() - started, 2)}
         if op == "shutdown":
             self._stopping.set()
             return {"ok": True, "shutting_down": True}
@@ -194,12 +307,14 @@ class Server:
 
     def _reaper(self) -> None:
         while not self._stopping.wait(15.0):
-            if self.idle_seconds <= 0 or not self.resident.alive:
+            if self.idle_seconds <= 0:
                 continue
-            if self.resident.last_used and \
-                    time.time() - self.resident.last_used > self.idle_seconds:
-                log(f"idle {self.idle_seconds:.0f}s -> releasing the model")
-                self.resident.release()
+            now = time.time()
+            for name, holder in (("reader", self.resident), ("decider", self.decider)):
+                if holder.alive and holder.last_used and \
+                        now - holder.last_used > self.idle_seconds:
+                    log(f"idle {self.idle_seconds:.0f}s -> releasing the {name}")
+                    holder.release()
 
     def run(self) -> int:
         os.makedirs(os.path.dirname(self.socket_path) or ".", exist_ok=True)
@@ -265,6 +380,10 @@ def main() -> int:
     serve.add_argument("--model", default=DEFAULT_MODEL)
     serve.add_argument("--device", default="mps")
     serve.add_argument("--idle-seconds", type=float, default=900.0)
+    serve.add_argument("--decision-model", default=DEFAULT_DECISION_MODEL)
+    noul = sub.add_parser("noul", help="ask a running server a typed yes/no about images")
+    noul.add_argument("images", nargs="+")
+    noul.add_argument("--question", required=True)
     read = sub.add_parser("read", help="ask a running server to read images")
     read.add_argument("images", nargs="+")
     read.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -275,7 +394,8 @@ def main() -> int:
 
     if args.command == "serve":
         return Server(os.path.expanduser(args.socket), os.path.expanduser(args.model),
-                      args.device, args.idle_seconds).run()
+                      args.device, args.idle_seconds,
+                      os.path.expanduser(args.decision_model)).run()
     if args.command == "read":
         reply = request(args.socket, {
             "op": "read",
@@ -287,6 +407,16 @@ def main() -> int:
         for page in reply["pages"]:
             print(f"=== {page['path']} ({page['seconds']}s) ===")
             print(page["text"] or "(no text)")
+        return 0
+    if args.command == "noul":
+        reply = request(args.socket, {
+            "op": "noul", "question": args.question,
+            "paths": [os.path.abspath(os.path.expanduser(p)) for p in args.images]})
+        if not reply.get("ok"):
+            print(reply.get("error", "failed"), file=sys.stderr)
+            return 1
+        for answer in reply["answers"]:
+            print(f"{os.path.basename(answer['path']):<24} P={answer['p']:.4f}")
         return 0
     op = {"status": "status", "release": "release", "stop": "shutdown"}[args.command]
     print(json.dumps(request(args.socket, {"op": op}, timeout=30), ensure_ascii=False, indent=2))

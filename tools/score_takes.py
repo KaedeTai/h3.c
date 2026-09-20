@@ -23,7 +23,7 @@ because a take that broke it was unusable, not because it scored badly:
 Nothing here is a quality judgement about the acting. It removes takes that
 are broken and orders the rest by the one thing that is measurable.
 
-    score_takes.py [--speech|--silent] [--ocr|--vlm MODEL|--geometry]
+    score_takes.py [--speech|--silent] [--noul|--ocr|--vlm MODEL|--geometry]
                    [--ocr-socket PATH] [--json OUT] take.mp4 ...
 """
 
@@ -95,6 +95,7 @@ def score_take(path: str, speech: bool | None = None,
         "subtitle_pct": None,
         "subtitle_limit": SUBTITLE_LIMIT,
         "subtitle_text": None,
+        "subtitle_confidence": None,
         "motion": None,
         "lipsync_r": None,
         "lipsync_lag": None,
@@ -108,7 +109,13 @@ def score_take(path: str, speech: bool | None = None,
         return result
 
     try:
-        if caption_method == "ocr":
+        if caption_method == "noul":
+            pct, scores = subtitle_rate.rate_noul(path, socket_path=ocr_socket)
+            result["subtitle_pct"] = round(pct, 1)
+            result["subtitle_limit"] = subtitle_rate.NOUL_LIMIT
+            if scores:
+                result["subtitle_confidence"] = round(max(scores), 3)
+        elif caption_method == "ocr":
             # Reads the frame and reports the words, so a rejected take says
             # WHAT it burned in -- 「白露秋分夜」 means the model is captioning
             # its own dialogue, a shop sign means the reference image did it.
@@ -168,6 +175,8 @@ def score_take(path: str, speech: bool | None = None,
             except Exception:
                 pass    # no reader is a missing explanation, not a failed take
         reason = f"{result['subtitle_pct']:.0f}% of frames carry a caption"
+        if result.get("subtitle_confidence") is not None:
+            reason += f"（最高把握 {result['subtitle_confidence']:.2f}）"
         if result.get("subtitle_text"):
             reason += f"：「{result['subtitle_text']}」"
         result["reasons"].append(reason)
@@ -215,13 +224,15 @@ def main(argv: list[str]) -> int:
     if "--no-ocr-text" in argv:
         argv.remove("--no-ocr-text")
         ocr_socket = False      # do not even try to read the words
+    if "--noul" in argv:
+        argv.remove("--noul")
+        caption_method = "noul"
     if "--ocr" in argv:
         argv.remove("--ocr")
         caption_method = "ocr"
     if "--ocr-socket" in argv:
         index = argv.index("--ocr-socket")
         ocr_socket = argv[index + 1]
-        caption_method = "ocr"
         del argv[index:index + 2]
     vlm_model = None
     if "--vlm" in argv:
