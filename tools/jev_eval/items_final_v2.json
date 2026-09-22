@@ -1,0 +1,54 @@
+{
+  "note": "Pre-registered before v2 was trained (committed ahead of the v2 corpus). v1's held-out run exposed a failure mode -- a compound negation, 'X, not dialogue' -- so items_nocue.json can no longer serve as an untouched test for anything tuned after it. This set is new: 32 hand-written OCR lines (16 dialogue, 16 incidental), text only with no scene description, and a phrasing set that includes compound and complementary framings in wording that appears in neither the training nor the dev pools (build_zh.py asserts it). Labels are the author's; every item was chosen to be decidable from the text by a person.",
+  "phrasings": {
+    "zh": {
+      "equivalent": [
+        "字幕上的這句話是角色講的。",
+        "這段文字是影片裡人物的對話內容。",
+        "畫面出現的是某人說話的字幕。",
+        "這是一句被打成字幕的台詞。",
+        "觀眾看到的這行字，是有人說出口的話。"
+      ],
+      "negated": [
+        "這行字不是任何角色的台詞。",
+        "這不是對話字幕。",
+        "這是畫面中物體或背景上的文字，不屬於對白。",
+        "這段字屬於招牌、標語、新聞或介面這類非對白的文字。"
+      ]
+    }
+  },
+  "items": [
+    {"lang": "zh", "gold": 1, "state": "OCR：「你到底有沒有在聽我說話？」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「別再騙我了！」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「媽，我今天不回家吃飯。」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「這件事我們明天再談」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「欸，你看那邊」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「我以為你不會來了。」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「你是不是瘦了？」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「先把東西放下」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「那時候我們都還太年輕」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「我們分手吧。」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「電影幾點開始？」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「好久不見」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「……然後他就再也沒回來過」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「謝謝你一直陪著我」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「不要再打給我了」"},
+    {"lang": "zh", "gold": 1, "state": "OCR：「我保證下次不會了」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「永結同心」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「國泰民安」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「請勿將衛生紙以外的物品丟入馬桶」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「本停車場二十四小時營業」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「阿美早餐店」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「最後一班車 23:40」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「立法院今三讀通過勞基法修正案」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「油價下週一起每公升調降兩角」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「特別感謝 台北市政府文化局」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「本故事純屬虛構 如有雷同純屬巧合」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「點擊跳過片頭」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「客家電視台」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「新開幕 全品項八折」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「限量五十份 售完為止」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「第二屆全國青年書法比賽」"},
+    {"lang": "zh", "gold": 0, "state": "OCR：「台北市立第一女子高級中學」"}
+  ]
+}

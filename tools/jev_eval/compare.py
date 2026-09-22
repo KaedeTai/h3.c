@@ -66,6 +66,8 @@ def report(path):
           f"({d['seconds'] / d['questions'] * 1000:.0f} ms per question)")
     for lang in ("en", "zh", "all"):
         rs = [r for r in d["results"] if lang == "all" or r["lang"] == lang]
+        if not rs or (lang == "all" and len({r["lang"] for r in rs}) < 2):
+            continue                      # "all" only means something when two languages are mixed
         gold = [r["gold"] for r in rs]
         n_ph = len(rs[0]["equivalent"])
         by_ph = [[r["equivalent"][i] for r in rs] for i in range(n_ph)]
