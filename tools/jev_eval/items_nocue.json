@@ -1,0 +1,58 @@
+{
+  "note": "Control for a confound in items.json: there, gold=1 states said 'bottom'/'lower third' and gold=0 said 'awning'/'corner'/'over black', so a model could score perfectly off the position word alone without reading the text. Here every state says only 'OCR of on-screen text', and the decision has to come from what the text actually says.",
+  "phrasings": {
+    "en": {
+      "equivalent": [
+        "The text on screen is a subtitle transcribing what is being said.",
+        "This on-screen text is a caption of the spoken dialogue.",
+        "What appears on screen is a transcription of the speech in this shot.",
+        "The visible text repeats the words being spoken.",
+        "This is burnt-in dialogue subtitling, not incidental scene text."
+      ],
+      "negated": [
+        "The text on screen is NOT a subtitle of the spoken dialogue.",
+        "This on-screen text is incidental scene text rather than a caption of the speech."
+      ]
+    },
+    "zh": {
+      "equivalent": [
+        "畫面上的文字是台詞字幕。",
+        "這段螢幕上的文字是把說話內容打出來的字幕。",
+        "畫面中出現的文字，內容就是這一鏡的對白。",
+        "看得到的文字重複了正在說的話。",
+        "這是燒進畫面的對白字幕，不是場景裡本來就有的字。"
+      ],
+      "negated": [
+        "畫面上的文字不是台詞字幕。",
+        "這段文字是場景裡本來就存在的字，不是對白字幕。"
+      ]
+    }
+  },
+  "items": [
+    {"lang": "en", "gold": 1, "state": "Shot: two people in a kitchen. OCR of on-screen text: \"I told you not to open that door.\""},
+    {"lang": "en", "gold": 1, "state": "Shot: a man on a phone at night. OCR of on-screen text: \"She's not picking up. Something's wrong.\""},
+    {"lang": "en", "gold": 1, "state": "Shot: one person facing camera. OCR of on-screen text: \"...and that was the moment I decided to quit.\""},
+    {"lang": "en", "gold": 1, "state": "Shot: a woman on a bench. OCR of on-screen text: \"It wasn't your fault.\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a busy street. OCR of on-screen text: \"BLUE RIBBON BAKERY - EST. 1974\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a laptop in close-up. OCR of on-screen text: \"File Edit View History Bookmarks Window Help\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a news studio. OCR of on-screen text: \"BREAKING - TYPHOON WARNING ISSUED FOR EASTERN COAST\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a runner. OCR of on-screen text: \"SONY 4K | REC 00:12:44\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a T-shirt in close-up. OCR of on-screen text: \"NOTHING TO SEE HERE\""},
+    {"lang": "en", "gold": 1, "state": "Shot: two soldiers behind cover. OCR of on-screen text: \"Cover me.\" / \"On three.\""},
+    {"lang": "en", "gold": 0, "state": "Shot: the end of a video. OCR of on-screen text: \"Directed by A. Mori - Produced by Kite Films\""},
+    {"lang": "en", "gold": 1, "state": "Shot: a chef in a kitchen. OCR of on-screen text: \"...so you want the pan smoking before anything goes in.\""},
+
+    {"lang": "zh", "gold": 1, "state": "鏡頭：兩個人在廚房。畫面上文字的 OCR：「我說過不要開那扇門。」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：男子夜裡講電話。畫面上文字的 OCR：「她不接電話，一定出事了。」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：一個人對著鏡頭。畫面上文字的 OCR：「……那一刻我就決定不做了。」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：女子坐在長椅上。畫面上文字的 OCR：「這不是你的錯。」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：迪化街街景。畫面上文字的 OCR：「德仁堂蔘藥行」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：黃色漢服特寫。畫面上文字的 OCR：「福壽康寧」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：新聞攝影棚。畫面上文字的 OCR：「快訊：東部海域發布颱風警報」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：跑者。畫面上文字的 OCR：「中華電視公司 HD」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：兩名士兵躲在掩體後。畫面上文字的 OCR：「掩護我。」「數到三。」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：影片結尾黑底。畫面上文字的 OCR：「導演 森田一郎　製作 風箏影業」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：廚師邊做菜邊講解。畫面上文字的 OCR：「……所以鍋子要先燒到冒煙，東西才下去。」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：便利商店立牌特寫。畫面上文字的 OCR：「熱咖啡 買一送一」"}
+  ]
+}

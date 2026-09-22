@@ -1,0 +1,58 @@
+{
+  "note": "Hand-written items for the caption-gate decision: is this OCR'd on-screen text a transcription of the spoken dialogue (a burnt-in subtitle), or incidental text that happens to be in the picture? Labels are the author's. The headline metric (spread across equivalent phrasings) needs no labels.",
+  "phrasings": {
+    "en": {
+      "equivalent": [
+        "The text on screen is a subtitle transcribing what is being said.",
+        "This on-screen text is a caption of the spoken dialogue.",
+        "What appears on screen is a transcription of the speech in this shot.",
+        "The visible text repeats the words being spoken.",
+        "This is burnt-in dialogue subtitling, not incidental scene text."
+      ],
+      "negated": [
+        "The text on screen is NOT a subtitle of the spoken dialogue.",
+        "This on-screen text is incidental scene text rather than a caption of the speech."
+      ]
+    },
+    "zh": {
+      "equivalent": [
+        "畫面上的文字是台詞字幕。",
+        "這段螢幕上的文字是把說話內容打出來的字幕。",
+        "畫面中出現的文字，內容就是這一鏡的對白。",
+        "看得到的文字重複了正在說的話。",
+        "這是燒進畫面的對白字幕，不是場景裡本來就有的字。"
+      ],
+      "negated": [
+        "畫面上的文字不是台詞字幕。",
+        "這段文字是場景裡本來就存在的字，不是對白字幕。"
+      ]
+    }
+  },
+  "items": [
+    {"lang": "en", "gold": 1, "state": "Shot: two people talking in a kitchen. OCR of the lower third of the frame: \"I told you not to open that door.\""},
+    {"lang": "en", "gold": 1, "state": "Shot: a man on a phone, night street. OCR at the bottom centre: \"She's not picking up. Something's wrong.\""},
+    {"lang": "en", "gold": 1, "state": "Shot: interview, single speaker to camera. OCR bottom: \"...and that was the moment I decided to quit.\""},
+    {"lang": "en", "gold": 1, "state": "Shot: woman crying on a bench. OCR bottom, white text with black outline: \"It wasn't your fault.\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a busy street. OCR across a storefront awning: \"BLUE RIBBON BAKERY - EST. 1974\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a laptop screen in close-up. OCR of the window: \"File Edit View History Bookmarks Window Help\""},
+    {"lang": "en", "gold": 0, "state": "Shot: news studio. OCR of the lower-third graphic: \"BREAKING - TYPHOON WARNING ISSUED FOR EASTERN COAST\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a runner. OCR of the corner watermark: \"SONY 4K | REC 00:12:44\""},
+    {"lang": "en", "gold": 0, "state": "Shot: a T-shirt in close-up. OCR of the print on the chest: \"NOTHING TO SEE HERE\""},
+    {"lang": "en", "gold": 1, "state": "Shot: two soldiers behind cover. OCR bottom centre, two lines: \"Cover me.\" / \"On three.\""},
+    {"lang": "en", "gold": 0, "state": "Shot: end of a video. OCR centred over black: \"Directed by A. Mori - Produced by Kite Films\""},
+    {"lang": "en", "gold": 1, "state": "Shot: a chef mid-sentence, kitchen. OCR bottom: \"...so you want the pan smoking before anything goes in.\""},
+
+    {"lang": "zh", "gold": 1, "state": "鏡頭：兩個人在廚房爭執。畫面下方三分之一處的 OCR：「我說過不要開那扇門。」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：男子夜裡在街上講電話。畫面正下方 OCR：「她不接電話，一定出事了。」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：受訪者對著鏡頭說話。下方 OCR：「……那一刻我就決定不做了。」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：女子坐在長椅上哭。下方白字黑邊 OCR：「這不是你的錯。」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：迪化街街景。店家木招牌上的 OCR：「德仁堂蔘藥行」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：黃色漢服特寫，人物沒有說話。衣襟刺繡上的 OCR：「福壽康寧」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：新聞攝影棚。下方標題條的 OCR：「快訊：東部海域發布颱風警報」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：跑者。畫面右上角浮水印 OCR：「中華電視公司 HD」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：兩名士兵躲在掩體後。畫面下方兩行 OCR：「掩護我。」「數到三。」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：影片結尾黑底。置中 OCR：「導演 森田一郎　製作 風箏影業」"},
+    {"lang": "zh", "gold": 1, "state": "鏡頭：廚師邊做菜邊講解。下方 OCR：「……所以鍋子要先燒到冒煙，東西才下去。」"},
+    {"lang": "zh", "gold": 0, "state": "鏡頭：便利商店門口立牌特寫。立牌上的 OCR：「熱咖啡 買一送一」"}
+  ]
+}
