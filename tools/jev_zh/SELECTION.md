@@ -46,3 +46,9 @@ test, so this file does not. What the gap shows is a hole in the dev set -- almo
 notices, promotional sentences or credits with verbs -- which is what let v2's over-confidence
 through. This test is now spent; the next comparison needs fresh data, ideally real OCR lines
 from the EP3 footage.
+
+## Real EP3 footage (ep3real/, pre-registered, run once, 2026-09-23)
+
+506 hand-labelled OCR lines from 923 EP3 videos. v2 test AUC 0.875 (readable captions 0.993),
+v3 0.820 (bootstrap v3-v2 -0.092..-0.021), v1 0.883 (level). **v2 remains the release
+candidate; gate threshold 0.824.** Details and the text-only ceiling in ep3real/PREREG.md.
