@@ -33,7 +33,7 @@ whatever the others show; nothing is retrained on its result.
 | v1 | 0.98 – 1.00 | 1.00 | +0.98 | 0.18 | 0.938 |
 | v3 | 0.99 – 1.00 | 1.00 | +0.93 | 0.08 | 0.969 |
 | open-jev (English) | 0.30 – 0.77 | 0.65 | +0.70 | 0.09 | — |
-| Ornith logit read | see out_ornith_final_v2.json | | | | — |
+| Ornith logit read | 0.41 – 0.70 | 0.52 | −0.06 | 0.77 | — |
 
 The headline is v2, as committed above. It ranks every item correctly (AUC 1.00, stable across
 all five phrasings) but is over-confident on scene text that reads like a sentence: 請勿將衛生紙以外
