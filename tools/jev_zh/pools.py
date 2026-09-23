@@ -116,3 +116,75 @@ SHORT_LINES_B = ["沒事吧？", "走吧。", "怎麼了？", "不會吧。", "�
 FINAL_TEST_FORBIDDEN = ["德仁", "福壽康寧", "東部海域", "中華電視", "華視", "森田", "風箏", "熱咖啡",
                         "我說過不要開那扇門", "她不接電話", "那一刻我就決定不做了", "這不是你的錯",
                         "掩護我", "數到三", "鍋子要先燒到冒煙"]
+
+# ---- v2: the framings v1 barely saw ---------------------------------------------------------
+# v1 asked almost only "is this dialogue?" (plain or lexically negated), so a claim that affirms
+# the complement ("this is scene text") or pairs both ("X, not dialogue") landed between the two
+# answers. These families teach that relation directly. None of the strings below appear in
+# either final test (asserted in build_zh.py).
+COMPLEMENT_TRAIN = [                      # gold = not dialogue
+    "這是畫面裡本來就有的文字。", "這行字是拍攝現場原本就存在的。", "這是招牌、告示或物品上印的字。",
+    "這段文字屬於場景文字。", "這些字是後製加上、但不是對白的資訊。", "這是新聞標題、台標或介面之類的文字。",
+    "這段字是廣告、商品或促銷用的文字。", "這行字印在衣服、布條或器物上。",
+]
+COMPOUND_NEG_TEMPLATES = ["這段文字是{x}，並不是人物的台詞。", "這是{x}，不算對白。",
+                          "這行字不是說出口的話，而是{x}。", "與其說是對白，這更像是{x}。"]
+COMPOUND_X = ["場景中原有的字", "畫面裡物品上的字", "招牌或標語", "後製加上的說明文字", "背景裡的文字"]
+COMPOUND_NEG_TRAIN = [t.format(x=x) for t in COMPOUND_NEG_TEMPLATES for x in COMPOUND_X]
+COMPOUND_POS_TRAIN = [                    # gold = dialogue
+    "這段字是角色的台詞，而非場景文字。", "這行字記錄的是對話，不是招牌或標示。",
+    "這不是背景裡的字，是有人說的話。", "這段文字來自人物開口說話，並非畫面原有的字。",
+]
+CATEGORY_CLAIMS = [                       # one per CAPTION_CATEGORIES entry; gold = (cat == k)
+    "這是人物對話的字幕。", "這是店家招牌、路標或告示上的字。", "這是新聞標題或跑馬燈。",
+    "這是片頭或片尾的演職員名單。", "這是電視台標誌、播放介面或浮水印。", "這是商品、廣告或促銷文字。",
+    "這是衣服或器物上的圖案文字。",
+]
+NOUL_DEV_NEG_V2 = NOUL_DEV_NEG + [        # compound framings for the dev probe, own wording
+    "這行字是場景裡看得到的東西上面的字，而不是誰說的話。", "這些字比較像招牌或新聞標題，並非對話。",
+]
+FINAL_V2_FORBIDDEN = ["永結同心", "國泰民安", "衛生紙以外", "本停車場二十四小時", "阿美早餐", "最後一班車",
+                      "勞基法修正案", "每公升調降兩角", "台北市政府文化局", "純屬虛構", "跳過片頭", "客家電視",
+                      "全品項八折", "限量五十份", "青年書法比賽", "第一女子高級中學"]
+
+# ---- v3: compositional compound claims --------------------------------------------------------
+# v2 diagnostic: on scene-text states the model answers "no" to any claim that mentions dialogue,
+# true or not ("不是說出口的話，而是招牌或標語" -> 0.34 error on a TRAINED wording). On dialogue
+# states that shortcut happens to give the right answer, so sparse compound examples barely
+# pushed against it. v3 builds compound claims from slots -- both polarities, both word orders,
+# many descriptors -- and asks one on every state, so claims that name dialogue carry gold "yes"
+# on scene states as often as gold "no".
+C_SUBJ = ["這段文字", "這行字", "畫面上的字", "這些字", "螢幕上這段字", "這幾個字"]
+C_SCENE = ["場景中原有的字", "畫面裡物品上的字", "招牌或標語", "後製加上的說明文字", "背景裡的文字",
+           "店家招牌上的字", "路標或告示", "新聞標題", "電視台的標誌", "商品上印的字", "牆上寫的字",
+           "衣服上的圖案字", "片尾的工作人員名單", "播放介面上的字"]
+C_DLG = ["人物的台詞", "對白", "角色說的話", "有人講出口的話", "說話的字幕", "劇中人講的話", "角色之間的對話"]
+C_TPL = ["{s}是{a}，不是{b}。", "{s}是{a}，並不是{b}。", "{s}不是{b}，而是{a}。", "與其說是{b}，{s}更像是{a}。",
+         "{s}屬於{a}，不屬於{b}。", "{s}並非{b}，只是{a}。", "{s}是{a}，而非{b}。", "說{s}是{b}不對，它其實是{a}。"]
+
+
+def _compound_all():
+    """Every compound claim, as (text, affirms_dialogue). {a} is what the claim affirms."""
+    out = []
+    for t in C_TPL:
+        for s in C_SUBJ:
+            for sc in C_SCENE:
+                for d in C_DLG:
+                    out.append((t.format(s=s, a=sc, b=d), False))   # affirms scene text
+                    out.append((t.format(s=s, a=d, b=sc), True))    # affirms dialogue
+    return out
+
+
+def compound_claims(final_phrasings, dev_phrasings):
+    """The trainable compound claims: anything too close to a dev or final-test phrasing is out."""
+    import difflib
+    guard = list(final_phrasings) + list(dev_phrasings)
+    keep, dropped = [], 0
+    for text, affirms_dlg in _compound_all():
+        close = any(g in text or text in g or difflib.SequenceMatcher(None, text, g).ratio() > 0.75
+                    for g in guard)
+        if close:
+            dropped += 1
+        else:
+            keep.append((text, affirms_dlg))
+    return keep, dropped

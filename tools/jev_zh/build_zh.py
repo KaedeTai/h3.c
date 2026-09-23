@@ -36,6 +36,9 @@ from typed_decisions.schema import Example, Question, NOUL_OPTIONS, write_jsonl 
 import pools as P  # noqa: E402
 
 NO = list(NOUL_OPTIONS)
+V2 = True        # set by --v1 to rebuild the v1 corpus exactly
+V3 = True        # --version 3: compositional compound claims on every caption state
+COMPOUNDS = []   # filled in build() once the dev/final phrasings are known
 _cc = None
 
 
@@ -348,17 +351,45 @@ def caption(split: str, n: int, pools: CaptionPools, phr_pos, phr_neg, rng) -> l
     out = []
     for i in range(n):
         cat = 0 if rng.random() < 0.5 else rng.randint(1, 6)
-        text = pools.dialogue() if cat == 0 else pools.incidental(cat)
-        for bad in P.FINAL_TEST_FORBIDDEN:
-            assert bad not in text, (bad, text)
+        # real corpus text can contain a final-test phrase by chance (a C3 passenger asks when the
+        # 最後一班車 leaves): such lines are dropped and redrawn, never trained on
+        for _ in range(50):
+            text = pools.dialogue() if cat == 0 else pools.incidental(cat)
+            if not any(bad in text for bad in P.FINAL_TEST_FORBIDDEN + P.FINAL_V2_FORBIDDEN):
+                break
+        else:
+            raise RuntimeError("could not draw a clean text")
         is_dlg = int(cat == 0)
         a, b = rng.sample(phr_pos, 2)
         qs = [Question(f"cap-{split}-{i}-d1", "noul", a, NO, is_dlg)]
-        if rng.random() < 0.35:
+        if V3:
+            text_c, affirms_dlg = rng.choice(COMPOUNDS)
+            qs.append(Question(f"cap-{split}-{i}-cmp", "noul", text_c, NO, int(affirms_dlg) if is_dlg else int(not affirms_dlg)))
+            if rng.random() < 0.5:
+                qs.append(Question(f"cap-{split}-{i}-cpl", "noul", rng.choice(P.COMPLEMENT_TRAIN), NO, 1 - is_dlg))
+            else:
+                qs.append(Question(f"cap-{split}-{i}-neg", "noul", rng.choice(phr_neg), NO, 1 - is_dlg))
+        elif V2:
+            roll = rng.random()      # the second claim: same, negated, complement, or compound
+            if roll < 0.30:
+                q2, g2 = b, is_dlg
+            elif roll < 0.50:
+                q2, g2 = rng.choice(phr_neg), 1 - is_dlg
+            elif roll < 0.70:
+                q2, g2 = rng.choice(P.COMPLEMENT_TRAIN), 1 - is_dlg
+            elif roll < 0.85:
+                q2, g2 = rng.choice(P.COMPOUND_NEG_TRAIN), 1 - is_dlg
+            else:
+                q2, g2 = rng.choice(P.COMPOUND_POS_TRAIN), is_dlg
+            qs.append(Question(f"cap-{split}-{i}-d2", "noul", q2, NO, g2))
+        elif rng.random() < 0.35:
             qs.append(Question(f"cap-{split}-{i}-dn", "noul", rng.choice(phr_neg), NO, 1 - is_dlg))
         else:
             qs.append(Question(f"cap-{split}-{i}-d2", "noul", b, NO, is_dlg))
         qs.append(Question(f"cap-{split}-{i}-cat", "choice", "畫面上這段文字屬於哪一類？", list(P.CAPTION_CATEGORIES), cat))
+        if V2:
+            k = cat if rng.random() < 0.5 else rng.randrange(len(P.CATEGORY_CLAIMS))
+            qs.append(Question(f"cap-{split}-{i}-k", "noul", P.CATEGORY_CLAIMS[k], NO, int(k == cat)))
         out.append(Example(state=pools.state(text), source="caption", meta={"i": i, "split": split, "cat": cat, "text": text}, questions=qs))
     return out
 
@@ -380,10 +411,22 @@ def build(out: str, seed: int, scale: float):
     os.makedirs(out, exist_ok=True)
 
     final = json.load(open(os.path.join(HERE, "..", "jev_eval", "items_nocue.json")))
-    final_phr = set(final["phrasings"]["zh"]["equivalent"] + final["phrasings"]["zh"]["negated"])
-    ours = set(P.NOUL_TRAIN + P.NOUL_TRAIN_NEG + P.NOUL_DEV + P.NOUL_DEV_NEG)
-    assert not (ours & final_phr), ours & final_phr
-    assert not (set(P.NOUL_TRAIN) & set(P.NOUL_DEV))
+    final2 = json.load(open(os.path.join(HERE, "..", "jev_eval", "items_final_v2.json")))
+    final_phr = set()
+    for f in (final, final2):
+        final_phr |= set(f["phrasings"]["zh"]["equivalent"] + f["phrasings"]["zh"]["negated"])
+    train_phr = set(P.NOUL_TRAIN + P.NOUL_TRAIN_NEG + P.COMPLEMENT_TRAIN + P.COMPOUND_NEG_TRAIN
+                    + P.COMPOUND_POS_TRAIN + P.CATEGORY_CLAIMS)
+    dev_phr = set(P.NOUL_DEV + P.NOUL_DEV_NEG_V2)
+    assert not ((train_phr | dev_phr) & final_phr), (train_phr | dev_phr) & final_phr
+    assert not any(f in t or t in f for f in final_phr for t in train_phr | dev_phr), "substring overlap"
+    assert not (train_phr & dev_phr), train_phr & dev_phr
+    global COMPOUNDS
+    if V3:
+        COMPOUNDS, dropped = P.compound_claims(final_phr, dev_phr)
+        cset = {t for t, _ in COMPOUNDS}
+        assert not (cset & final_phr) and not (cset & dev_phr)
+        print(f"compound claims: {len(COMPOUNDS)} kept, {dropped} dropped as too close to dev/final")
 
     S = lambda n: max(1, int(n * scale))
     pa, pb = CaptionPools("A", rng), CaptionPools("B", rng)
@@ -419,10 +462,14 @@ def build(out: str, seed: int, scale: float):
     dev_items = []
     for i in range(S(160)):
         cat = 0 if i % 2 == 0 else rng.randint(1, 6)
-        text = pb.dialogue() if cat == 0 else pb.incidental(cat)
+        while True:
+            text = pb.dialogue() if cat == 0 else pb.incidental(cat)
+            if not any(bad in text for bad in P.FINAL_TEST_FORBIDDEN + P.FINAL_V2_FORBIDDEN):
+                break
         dev_items.append({"lang": "zh", "gold": int(cat == 0), "cat": cat, "state": pb.state(text)})
     json.dump({"note": "dev set for iteration: pool-B states, NOUL_DEV phrasings; never the final test",
-               "phrasings": {"zh": {"equivalent": P.NOUL_DEV[:5], "negated": P.NOUL_DEV_NEG}},
+               "phrasings": {"zh": {"equivalent": P.NOUL_DEV[:5],
+                                    "negated": P.NOUL_DEV_NEG_V2 if V2 else P.NOUL_DEV_NEG}},
                "items": dev_items}, open(os.path.join(out, "dev_caption.json"), "w"), ensure_ascii=False, indent=1)
 
     # the final test with every scene stripped: only the OCR text is left to decide on
@@ -433,6 +480,15 @@ def build(out: str, seed: int, scale: float):
     tx["note"] = "items_nocue.json with the shot description removed: the OCR text alone"
     json.dump(tx, open(os.path.join(out, "final_textonly.json"), "w"), ensure_ascii=False, indent=1)
 
+    # how much of the v2 final test's dialogue already occurs somewhere in training captions --
+    # common phrases will; reported, not hidden
+    cap_texts = [e.meta["text"] for e in train if e.source == "caption"]
+    overlap = {}
+    for it in final2["items"]:
+        t = it["state"].split("「", 1)[1].rstrip("」").strip("。！？……")
+        hits = sum(1 for c in cap_texts if t and t in c)
+        if hits:
+            overlap[t] = hits
     stats = {n: {"states": len(x), "questions": sum(len(e.questions) for e in x)} for n, x in
              (("train", train), ("val", val), ("test", test), ("ood", ood))}
     from collections import Counter
@@ -445,7 +501,8 @@ def build(out: str, seed: int, scale: float):
         if L:   # length must not separate the classes on its own
             stats[f"caption_len_{name}"] = {"mean": round(st.mean(L), 1), "median": st.median(L),
                                             "p10": sorted(L)[len(L) // 10], "p90": sorted(L)[9 * len(L) // 10]}
-    json.dump(stats, open(os.path.join(out, "stats.json"), "w"), indent=1)
+    stats["final_v2_substring_hits_in_train_captions"] = overlap
+    json.dump(stats, open(os.path.join(out, "stats.json"), "w"), indent=1, ensure_ascii=False)
     print(json.dumps(stats, ensure_ascii=False, indent=1))
 
 
@@ -454,5 +511,8 @@ if __name__ == "__main__":
     ap.add_argument("--out", default=os.path.join(HERE, "data"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--version", type=int, default=3, choices=[1, 2, 3])
     a = ap.parse_args()
+    V2 = a.version >= 2
+    V3 = a.version >= 3
     build(a.out, a.seed, a.scale)
