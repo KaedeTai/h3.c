@@ -2867,6 +2867,7 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         return 1;
     }
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
+        !getenv("H3_DISABLE_MPS_LINEAR") &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
                           input_dim, output_dim,
                           MPSDataTypeBFloat16)) return 1;

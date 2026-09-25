@@ -1703,6 +1703,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (progress.cancelled) goto cleanup;
 
+    if (getenv("H3_DUMP_LATENT") && *getenv("H3_DUMP_LATENT") &&
+        text.values) {
+        char dump_path[1024];
+        snprintf(dump_path, sizeof(dump_path), "%s.text",
+                 getenv("H3_DUMP_LATENT"));
+        FILE *dump = fopen(dump_path, "wb");
+        if (dump) {
+            fwrite(text.values, sizeof(uint16_t), text.tokens * text.width,
+                   dump);
+            fclose(dump);
+        }
+    }
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
                            latent_w, temporal.audio_t, temporal.frame_count,
                            keyframes, keyframe_count,
@@ -1936,6 +1948,24 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_is_cached = 0;
         }
         goto cleanup;
+    }
+    if (getenv("H3_DUMP_LATENT") && *getenv("H3_DUMP_LATENT")) {
+        /* Debug: the denoised latents, raw F32, for run-to-run diffs. */
+        char dump_path[1024];
+        snprintf(dump_path, sizeof(dump_path), "%s.video",
+                 getenv("H3_DUMP_LATENT"));
+        FILE *dump = fopen(dump_path, "wb");
+        if (dump) {
+            fwrite(video, sizeof(float), video_count, dump);
+            fclose(dump);
+        }
+        snprintf(dump_path, sizeof(dump_path), "%s.audio",
+                 getenv("H3_DUMP_LATENT"));
+        dump = fopen(dump_path, "wb");
+        if (dump) {
+            fwrite(audio, sizeof(float), audio_count, dump);
+            fclose(dump);
+        }
     }
     if (dit) h3_dit_set_audio_anchor(dit, NULL);
     if (!dit_is_cached) h3_dit_free(dit);

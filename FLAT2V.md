@@ -649,6 +649,14 @@ same command twice differs even with rebind disabled and no rebind in play — s
 it was graded instead, three replicates each way behind an `H3_NO_REBIND`
 kill-switch:
 
+> **Update (2026-09-25):** both statements were prompt-dependent. The Qwen text
+> encoder's causal-attention kernel (`h3_gqa_causal_bf16`) reused its reduction
+> buffer for the softmax sum before every SIMD group had read the maximum, so
+> any prompt longer than 32 tokens got a wrong, run-to-run-varying embedding
+> for tokens 32 and up; short prompts were exact. The video-VAE encoder's group
+> norm had the same missing barrier. With both fixed, a 43-token T2VA prompt
+> and an FL2VA run are byte-identical across runs.
+
 | | n | mean aperture | s.d. |
 |---|---|---|---|
 | rebind off | 3 | 0.1012 | 0.0031 |
