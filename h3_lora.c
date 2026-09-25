@@ -18,6 +18,7 @@ typedef struct {
     char *path;
     char *label;
     float strength;
+    int comfy_qkv;
     h3_st_header header;
     size_t modules;
 } lora_file;
@@ -28,6 +29,7 @@ typedef struct {
     const h3_st_tensor *a;     /* [rank, columns] */
     const h3_st_tensor *b;     /* [rows, rank] */
     float scale;               /* strength * alpha / rank */
+    int comfy_qkv;             /* B rows in ComfyUI's fused-qkv order */
     unsigned applied;
 } lora_entry;
 
@@ -364,6 +366,8 @@ static int index_file(h3_lora_set *set, size_t file_index, char *error,
         entry->a = part->a;
         entry->b = part->b;
         entry->scale = file->strength * alpha / rank;
+        entry->comfy_qkv = file->comfy_qkv && ends_with(entry->target,
+                                                        "attn.qkv_proj.weight");
         entry->applied = 0;
         added++;
     }
@@ -396,6 +400,25 @@ h3_lora_set *h3_lora_open(const char *spec, char *error, size_t error_size) {
         size_t length = strlen(item);
         while (length && item[length - 1] == ' ') item[--length] = '\0';
         if (!length) continue;
+        /* Fused-qkv row order: every H3 LoRA checked so far (Comfy-Org and
+         * lightx2v turbo, fal trainer, ai-toolkit, DiffSynth exports) keeps
+         * ComfyUI's (q|k|v, head, 128) order, so that is the default;
+         * "NAME@native" or H3_LORA_QKV=native says the file is in h3.c's
+         * own (head, q|k|v, 128) order. tools/lora_qkv_layout.py tells
+         * which a file uses. */
+        int comfy_qkv = !(getenv("H3_LORA_QKV") &&
+                          !strcmp(getenv("H3_LORA_QKV"), "native"));
+        char *at = strrchr(item, '@');
+        if (at) {
+            if (!strcmp(at + 1, "native")) comfy_qkv = 0;
+            else if (!strcmp(at + 1, "comfy")) comfy_qkv = 1;
+            else {
+                fail(error, error_size,
+                     "LoRA %s: qkv order must be @comfy or @native", item);
+                goto failed;
+            }
+            *at = '\0';
+        }
         float strength = 1.0f;
         char *colon = strrchr(item, ':');
         if (colon && colon[1]) {
@@ -409,6 +432,7 @@ h3_lora_set *h3_lora_open(const char *spec, char *error, size_t error_size) {
         }
         lora_file *file = &set->files[set->file_count];
         file->strength = strength;
+        file->comfy_qkv = comfy_qkv;
         file->label = copy_string(item, strlen(item));
         file->path = resolve_path(item, error, error_size);
         if (!file->label || !file->path) {
@@ -637,9 +661,19 @@ static int merge(h3_lora_set *set, const char *name, int kind, void *weight,
         ok = part && read_floats(header, entry->b, part, entry->scale,
                                  error, error_size);
         if (!ok) break;
-        for (uint64_t row = 0; row < rows; row++)
-            memcpy(b + row * rank + offset, part + row * r,
+        /* ComfyUI keeps a fused qkv in (q|k|v, head, 128) row order; h3.c
+         * and the official checkpoint use (head, q|k|v, 128). An adapter
+         * made for the ComfyUI layout has its B rows in that order. */
+        int comfy_rows = entry->comfy_qkv && rows == 3 * 56 * 128;
+        for (uint64_t row = 0; row < rows; row++) {
+            uint64_t source = row;
+            if (comfy_rows) {
+                uint64_t head = row / 384, part_index = (row / 128) % 3;
+                source = part_index * 7168 + head * 128 + row % 128;
+            }
+            memcpy(b + row * rank + offset, part + source * r,
                    (size_t)r * sizeof(float));
+        }
         offset += r;
     }
     free(part);
@@ -703,8 +737,10 @@ void h3_lora_report(const h3_lora_set *set, FILE *stream) {
         for (size_t index = 0; index < set->count; index++)
             if (set->entries[index].file == file &&
                 set->entries[index].applied) applied++;
-        fprintf(stream, "h3: LoRA %s x%g: %zu/%zu modules merged\n",
-                set->files[file].label, (double)set->files[file].strength,
+        fprintf(stream, "h3: LoRA %s x%g (qkv %s order): %zu/%zu modules "
+                "merged\n", set->files[file].label,
+                (double)set->files[file].strength,
+                set->files[file].comfy_qkv ? "comfy" : "native",
                 applied, set->files[file].modules);
         for (size_t index = 0; index < set->count; index++) {
             const lora_entry *entry = &set->entries[index];

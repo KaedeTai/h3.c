@@ -425,6 +425,13 @@ and because the merge happens at load, a job with a different set restarts the
 resident child. A load prints one line per adapter (`208/208 modules merged`)
 and the merge time; strength 0 reproduces the no-LoRA output bit for bit.
 
+Fused `attn.qkv_proj` adapters are read in ComfyUI's row order,
+`(q|k|v, head, 128)`, and reordered to h3.c's `(head, q|k|v, 128)`: every H3
+LoRA checked (Comfy-Org and lightx2v turbo, fal trainer, ai-toolkit, larryvrh)
+uses the ComfyUI order, whatever its key prefix. `tools/lora_qkv_layout.py
+FILE` measures which order a new file uses; append `@native` to a spec
+(`--lora name:0.8@native`) for one that turns out to be in h3.c's order.
+
 The int8 bundles are already quantized, so a merge cannot start from the BF16
 weight. Rounding the merged value to the nearest code would drop every delta
 under half a step -- most of a typical LoRA (`tools/eval_lora_int8_merge.py`

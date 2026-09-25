@@ -22,7 +22,11 @@
  *           lora_B.default.weight, lora_down.weight / lora_up.weight
  *   alpha:  <module>.alpha (scale = alpha / rank; without it, scale = 1)
  * DoRA and full-weight patches (dora_scale, diff, diff_b) are refused rather
- * than half-applied. */
+ * than half-applied.
+ *
+ * A fused attn.qkv_proj adapter's B rows are read in ComfyUI's
+ * (q|k|v, head, 128) order and reordered to h3.c's (head, q|k|v, 128); see
+ * h3_lora_open for the override. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -30,7 +34,8 @@
 
 typedef struct h3_lora_set h3_lora_set;
 
-/* spec: comma-separated items, each "PATH_OR_NAME[:STRENGTH]". A NAME is
+/* spec: comma-separated items, each "PATH_OR_NAME[:STRENGTH][@comfy|@native]"
+ * (the suffix is the fused-qkv row order, default comfy). A NAME is
  * looked up under $H3_LORA_DIR (default ~/models/loras/h3) as a file, as
  * NAME.safetensors, or as a directory holding exactly one .safetensors. */
 h3_lora_set *h3_lora_open(const char *spec, char *error, size_t error_size);

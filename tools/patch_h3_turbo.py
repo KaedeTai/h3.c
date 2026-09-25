@@ -58,6 +58,11 @@ for si, sh in enumerate(shards):
             lk = "diffusion_model." + base
             A = L[lk + ".lora_A.weight"].astype(mx.float32)
             B = L[lk + ".lora_B.weight"].astype(mx.float32)
+            if base.endswith("attn.qkv_proj") and os.environ.get("H3_LORA_QKV", "comfy") != "native":
+                # ComfyUI LoRAs keep fused qkv rows as (q|k|v, head, 128); the
+                # checkpoint is (head, q|k|v, 128). Merged unreordered before
+                # 2026-09-25, which scrambled the qkv half of the turbo delta.
+                B = B.reshape(3, 56, 128, -1).transpose(1, 0, 2, 3).reshape(B.shape)
             scale = float(L[lk + ".alpha"]) / A.shape[0] * STRENGTH
             w = W[k]
             dlt = (B @ A) * scale

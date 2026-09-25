@@ -302,6 +302,32 @@ the cost was not worth an aesthetic bet in the wrong direction.
 Revisit if the anime/CG timelapse work ever needs better base quality - the
 compatibility groundwork above is done.
 
+**Update 2026-09-25 - converted and running.** The repo's v1.3 files are now
+ComfyUI `int8_tensorwise` with **ConvRot** (`comfy_quant`: Hadamard groups of
+256, 64 for adaln), not plain per-row int8, and - like every Comfy-Org H3
+checkpoint - their fused qkv rows are in `(q|k|v, head, 128)` order, where h3.c
+and the official checkpoint use `(head, q|k|v, 128)`. `tools/convert_comfy_int8.py`
+undoes the rotation (`W = (q*scale) @ H` per group; H is symmetric orthogonal),
+reorders qkv (checked per tensor against the native weight), requantizes with
+h3.c's per-row rule and writes every tensor in the native dtype. Singularity's
+out_proj/fc1/fc2/adaln come back at cos 0.9999 against the official FL2VA
+base, qkv likewise once reordered. Bundles: `MiniMax-H3-singularity-int8`
+(95 s to build) and `MiniMax-H3-singularity-turbo-int8` with the ref2v turbo
+LoRA folded in while still float (121 s). All three variant dirs point at the
+one transformer. First look (Ref2VA, 4 steps): sharp, coherent faces, but it
+holds the reference image as the opening frame and drifts from scene prompts
+more than stock Ref2VA does.
+
+**The same qkv order problem is in our own turbo bundles.** Every H3 LoRA
+checked keeps ComfyUI's qkv order (tools/lora_qkv_layout.py: B's energy in the
+base weight's top-256 output subspace is at the random 1.2% read natively and
+~2% read in ComfyUI order; Singularity's own delta, whose order is known,
+gives 2.2% vs 1.3%). patch_h3_turbo.py merged the FL2VA v1.1 and Ref2VA v0.1
+turbo LoRAs as-is, so the qkv part of both turbo bundles is a scrambled delta
+(out_proj/fc1/fc2 are fine; T2VA is FastVideo's distillation and unaffected).
+A runtime correction, `--lora T:-1@native,T:1@comfy`, shows the effect; the
+clean fix is re-running the patch from BF16 with B reordered.
+
 ## Pre-quantized int8 checkpoints (2026-09-06)
 
 h3.c read 66 GB of BF16 per transformer and then quantized the four big

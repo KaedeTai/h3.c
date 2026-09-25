@@ -52,6 +52,8 @@ def main():
                 if pre + module + a_suf in lh:
                     A = read(path, lh, lbase, pre + module + a_suf).astype(np.float64)
                     B = read(path, lh, lbase, pre + module + b_suf).astype(np.float64)
+                    if module.endswith("attn.qkv_proj"):  # ComfyUI (q|k|v, head, d) rows
+                        B = B.reshape(3, 56, 128, -1).transpose(1, 0, 2, 3).reshape(B.shape)
                     alpha = float(read(path, lh, lbase, pre + module + ".alpha")) if pre + module + ".alpha" in lh else A.shape[0]
                     w = w + float(strength) * alpha / A.shape[0] * (B @ A)
     mx = np.abs(w).max(axis=1)

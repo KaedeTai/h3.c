@@ -36,3 +36,5 @@ libh3.a
 
 # Python caches.
 __pycache__/
+/MiniMax-H3-singularity-int8/
+/MiniMax-H3-singularity-turbo-int8/
