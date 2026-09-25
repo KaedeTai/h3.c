@@ -85,6 +85,11 @@ _MANAGED_ENV = (
     "H3_SIGMA_BASE",
     "H3_BENCH_SKIP_INT8_QUANT",
     "H3_STEEL_ATTN",
+    # LoRAs are merged into the weights at load, so they are part of the
+    # profile: a job with a different H3_LORA restarts the child.
+    "H3_LORA",
+    "H3_LORA_DIR",
+    "H3_LORA_ROUND",
 )
 
 
@@ -665,6 +670,8 @@ def main(argv=None) -> int:
     render.add_argument("--ref-image", action="append", default=[])
     render.add_argument("--ref-audio", action="append", default=[])
     render.add_argument("--variant", default="")
+    render.add_argument("--lora", action="append", default=[],
+                        help="NAME[:STRENGTH], repeatable; sets H3_LORA for the job")
 
     sub.add_parser("status", help="what the server is holding")
     sub.add_parser("release", help="drop the resident child, keep the server")
@@ -694,6 +701,8 @@ def main(argv=None) -> int:
     }
     if args.variant:
         job["variant"] = args.variant
+    if args.lora:
+        job["env"] = {"H3_LORA": ",".join(args.lora)}
     started = time.time()
     reply = client.render(**job)
     reply["client_seconds"] = round(time.time() - started, 2)

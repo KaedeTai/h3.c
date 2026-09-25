@@ -542,6 +542,9 @@ static int load_block_int8(h3_dit *dit, const char *prefix, const char *suffix,
         h3_weight_load_f32(dit->weights, dit->gpu, scale_name, 2, column,
                            error, error_size);
     if (!*scales) return -1;
+    if (!h3_weight_apply_lora_i8(dit->weights, name, *quantized, *scales,
+                                 rows, columns, error, error_size))
+        return -1;
     return 1;
 }
 
@@ -1690,6 +1693,18 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    /* H3_LORA="name[:strength],..." -- see h3_lora.h. The BF16 SSD stream
+     * reads layers straight from the shards every step, past the store, so it
+     * would silently skip the core blocks; refuse the pairing instead. */
+    if (getenv("H3_LORA") && *getenv("H3_LORA")) {
+        if (dit->ssd_streaming) {
+            fail(error, error_size,
+                 "H3_LORA cannot be combined with --ssd-streaming");
+            goto failed;
+        }
+        if (!h3_weight_store_attach_lora(dit->weights, getenv("H3_LORA"),
+                                         error, error_size)) goto failed;
+    }
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -1754,6 +1769,7 @@ static h3_dit *load_dit(const char *weight_directory,
         fail(error, error_size, "cannot write persistent DiT condition rows");
         goto failed;
     }
+    h3_weight_lora_report(dit->weights);
     h3_gpu_profile_mark(dit->gpu, "load");
     return dit;
 failed:

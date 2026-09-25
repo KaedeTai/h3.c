@@ -634,7 +634,8 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                                               size_t elements,
                                               size_t item_size,
                                               h3_gpu_dtype dtype,
-                                              const char *label) {
+                                              const char *label,
+                                              int force_copy) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !path || !*path || file_offset > INT64_MAX ||
         elements > SIZE_MAX / item_size) return NULL;
@@ -643,7 +644,7 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
     int transformer_weight = strstr(path, "/transformer/") != NULL;
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
-    int map_weight = bytes &&
+    int map_weight = bytes && !force_copy &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
          (transformer_weight &&
           ((zero_copy && !strcmp(zero_copy, "transformer")) ||
@@ -738,13 +739,13 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *opaque, const char *path,
                                        uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
-                                   sizeof(uint16_t), H3_GPU_BF16, "BF16");
+                                   sizeof(uint16_t), H3_GPU_BF16, "BF16", 0);
 }
 
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                       uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
-                                   sizeof(float), H3_GPU_F32, "F32");
+                                   sizeof(float), H3_GPU_F32, "F32", 0);
 }
 
 /* Pre-quantized checkpoints (tools/quantize_h3_int8.py) store the four big
@@ -752,7 +753,26 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
 h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *opaque, const char *path,
                                      uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
-                                   sizeof(int8_t), H3_GPU_I8, "I8");
+                                   sizeof(int8_t), H3_GPU_I8, "I8", 0);
+}
+
+/* As the loaders above, but always into freshly allocated storage, never a
+ * zero-copy mapping of the file: for weights the CPU will rewrite in place
+ * (the LoRA merge), where a MAP_PRIVATE mapping would take a copy-on-write
+ * fault on every page. */
+h3_gpu_tensor *h3_gpu_tensor_load_copy(h3_gpu *opaque, const char *path,
+                                       uint64_t file_offset, size_t elements,
+                                       h3_gpu_dtype dtype) {
+    if (dtype == H3_GPU_BF16)
+        return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                       sizeof(uint16_t), dtype, "BF16", 1);
+    if (dtype == H3_GPU_F32)
+        return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                       sizeof(float), dtype, "F32", 1);
+    if (dtype == H3_GPU_I8)
+        return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                       sizeof(int8_t), dtype, "I8", 1);
+    return NULL;
 }
 
 static int h3_gpu_tensor_read_file_bf16_mode(
@@ -908,6 +928,11 @@ int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                    char *error, size_t error_size) {
     return h3_gpu_tensor_read_file_bf16_mode(
         opaque, path, file_offset, elements, 1, error, error_size);
+}
+
+void *h3_gpu_tensor_host_pointer(h3_gpu_tensor *tensor) {
+    if (!tensor) return NULL;
+    return TENSOR(tensor).buffer.contents;
 }
 
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor) {

@@ -80,6 +80,12 @@ int h3_gpu_tensor_read_file_int4_group(h3_gpu_tensor *tensor, const char *path,
                                        size_t elements, size_t group,
                                        char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
+h3_gpu_tensor *h3_gpu_tensor_load_copy(h3_gpu *gpu, const char *path,
+                                       uint64_t file_offset, size_t elements,
+                                       h3_gpu_dtype dtype);
+/* CPU view of a tensor's shared storage, for in-place edits made while no GPU
+ * work references it (the LoRA merge at load). */
+void *h3_gpu_tensor_host_pointer(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
 int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,

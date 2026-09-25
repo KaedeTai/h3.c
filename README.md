@@ -403,6 +403,40 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 15 seconds.
 
+### 9. Add LoRAs
+
+LoRAs trained for MiniMax H3 (ComfyUI, fal trainer, ai-toolkit, DiffSynth/PEFT
+exports) load as they are. They are merged into the DiT weights while it loads,
+so they cost a few seconds of load time and nothing per step:
+
+```sh
+./h3 -d ./MiniMax-H3-turbo-int8 --lora vh5tape:1.0 \
+  -p "vh5tape, worn VHS tape recording ..." -o outputs/vhs.mp4
+# Stack several; a bare name is looked up under ~/models/loras/h3
+# (override with H3_LORA_DIR) as a file, NAME.safetensors, or a directory
+# holding one .safetensors.
+./h3 ... --lora realism-people:0.8 --lora camera-motion:0.5
+```
+
+`--lora` sets `H3_LORA` (comma-separated `NAME[:STRENGTH]`), which is what the
+DiT loader reads, so drivers can pass the variable instead:
+`tools/h3_worker.py render --lora NAME[:S]` sends it as the job's environment,
+and because the merge happens at load, a job with a different set restarts the
+resident child. A load prints one line per adapter (`208/208 modules merged`)
+and the merge time; strength 0 reproduces the no-LoRA output bit for bit.
+
+The int8 bundles are already quantized, so a merge cannot start from the BF16
+weight. Rounding the merged value to the nearest code would drop every delta
+under half a step -- most of a typical LoRA (`tools/eval_lora_int8_merge.py`
+measures 0–76% of it surviving). The merge instead keeps each row's grid and
+rounds stochastically, with a fixed per-weight seed, which keeps the delta in
+expectation (99–100% on the same test) at the cost of int8 noise a little
+above a fresh quantization. `H3_LORA_ROUND=nearest` restores plain rounding
+for comparison. `--ssd-streaming` reads layers past the loader and is refused
+with a LoRA. The base bundle already contains the turbo LoRA, so style
+adapters trained on the base model may want their authors' "with turbo"
+strengths.
+
 ## Tests and runtime requirements
 
 ```sh

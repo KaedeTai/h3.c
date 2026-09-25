@@ -1,4 +1,10 @@
 CC := clang
+# Link against the SDK of the selected developer dir. After an OS upgrade the
+# Command Line Tools can carry a newer SDK than Xcode's ld understands
+# ("tapi error: malformed file ... unknown architecture"); xcrun keeps the
+# compiler, SDK and linker from the same install.
+SDKROOT ?= $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
+export SDKROOT
 AR := ar
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
@@ -9,7 +15,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_lora.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c

@@ -46,6 +46,8 @@ static void usage(const char *program) {
         "      --use-slower-dynamic-fc1-k  Use runtime-bound FC1 K loop\n"
         "      --use-slower-grouped-quantizer  Force 256-thread FC2 quantizer\n"
         "      --seed N           Random seed (default: 42)\n"
+        "      --lora NAME[:S]    Merge a DiT LoRA at strength S (repeatable;\n"
+        "                         NAME is a path or a name under ~/models/loras/h3)\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
@@ -251,7 +253,7 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO, OPT_LORA };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -304,6 +306,7 @@ int main(int argc, char **argv) {
         {"zoom", required_argument, NULL, OPT_ZOOM},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
+        {"lora", required_argument, NULL, OPT_LORA},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -461,6 +464,22 @@ int main(int argc, char **argv) {
                 break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;
+            case OPT_LORA: {
+                /* Repeatable; joined into H3_LORA, which the DiT loader
+                 * reads (so the REPL and h3_worker.py see the same knob). */
+                const char *previous = getenv("H3_LORA");
+                size_t length = strlen(optarg) +
+                    (previous ? strlen(previous) + 1 : 0) + 1;
+                char *joined = malloc(length);
+                if (!joined) { fprintf(stderr, "h3: out of memory\n"); return 2; }
+                if (previous && *previous)
+                    snprintf(joined, length, "%s,%s", previous, optarg);
+                else
+                    snprintf(joined, length, "%s", optarg);
+                setenv("H3_LORA", joined, 1);
+                free(joined);
+                break;
+            }
             default: usage(argv[0]); return 2;
         }
     }
