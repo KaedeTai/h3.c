@@ -85,7 +85,7 @@ def _fps_mode_flag():
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def _dir():   return os.environ.get("FLAT2V_DIR", "/Users/kaede/models/_wang_test")
+def _dir():   return os.environ.get("FLAT2V_DIR", "/Users/kaede/h3.c/outputs/wang_test")
 def _ref():   return os.environ.get("FLAT2V_REF", f"{_dir()}/wang_wide34_480x640.png")
 def _wav():   return os.environ.get("FLAT2V_WAV", f"{_dir()}/wang_line_6575.wav")
 # Read the environment per call, not at import: a caller that imports this and

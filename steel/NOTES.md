@@ -389,7 +389,7 @@ re-quantized before anything will use it.
 ## The reference crop must be cropped to the canvas aspect, never resized to it
 
 Every head-shot take before 2026-09-06 15:40 (`E`, `F`, `G` in
-`~/models/_wang_test`) used `wang_head_ref.png`, which was the poster region
+`~/h3.c/outputs/wang_test`) used `wang_head_ref.png`, which was the poster region
 `(122,187,497x589)` *resized* to 384x512. 497/589 = 0.844, 384/512 = 0.750, so
 the reference face was squeezed 11% horizontally - and Ref2VA reproduced the
 squeeze faithfully for the whole clip. It reads as "he looks thinner than the

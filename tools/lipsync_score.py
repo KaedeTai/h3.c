@@ -43,7 +43,7 @@ def _fps_mode_flag():
 FPS = 24.0
 # inner lip contour: upper and lower midpoints, and the two corners
 UPPER, LOWER, LEFT, RIGHT = 13, 14, 78, 308
-MODEL = os.path.expanduser("~/models/_mp/face_landmarker.task")
+MODEL = os.path.expanduser("~/models/mediapipe/face_landmarker.task")
 
 
 def _landmarker():

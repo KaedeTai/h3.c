@@ -5,7 +5,7 @@ ROOT = os.path.expanduser("~/datasets/ep3_ocr")
 O = json.load(open(os.path.join(ROOT, "lines.json")))
 font = ImageFont.truetype("/System/Library/Fonts/STHeiti Medium.ttc", 20)
 ids = json.loads(open(sys.argv[1]).read()); prefix = sys.argv[2]; per = int(sys.argv[3]); cols = 5; tw = 320; th = 200
-outdir = os.path.expanduser("~/models/_ep3_label_sheets"); os.makedirs(outdir, exist_ok=True)
+outdir = os.path.expanduser("~/h3.c/outputs/ep3_label_sheets"); os.makedirs(outdir, exist_ok=True)
 for k in range(0, len(ids), per):
     chunk = ids[k:k + per]; rows = (len(chunk) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * tw, rows * (th + 24)), (0, 0, 0))
