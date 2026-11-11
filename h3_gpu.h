@@ -532,6 +532,7 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
  * `tokens_per_frame` adds the previous/next video frame as exact neighbours. The flag is consumed by that call. */
 void h3_gpu_set_sol(h3_gpu *gpu, int enabled, float tau, uint32_t dense_end,
                     uint32_t tokens_per_frame);
+void h3_gpu_set_head_major_sdpa_inputs(h3_gpu *gpu, int head_major);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

@@ -1998,6 +1998,11 @@ static int h3_gpu_sdpa_sage(H3GPU *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
+/* For tests and benchmarks: mark the next bf16 SDPA's inputs as [H,N,D] head major, as the fused QKV paths do. */
+void h3_gpu_set_head_major_sdpa_inputs(h3_gpu *opaque, int head_major) {
+    GPU(opaque).headMajorSDPAInputs = head_major != 0;
+}
+
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
