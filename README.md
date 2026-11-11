@@ -480,7 +480,11 @@ relative L2) and 16% (audio); the MLX run differs from itself at fp32 by 28%
 and 10%, so a 6-step trajectory is about that sensitive to arithmetic.
 M5 Max, 6 steps: 512x288x56 denoise 11.1 s; FL2VA 608x352x124 denoise 54.4 s
 (118 s end to end, 10.8 GB peak footprint); 1344x768x124 denoise 704 s
-(117 s a step -- attention-bound; 950 s end to end, 12.8 GB).
+(117 s a step -- attention-bound; 950 s end to end, 12.8 GB). At 1344x768
+the opt-in attentions are slower still: `H3_STEEL_ATTN=1` 127 s a step,
+`H3_INT8_ATTN=1` 140 s. The MLX port runs the same model at 17 s a step at
+608x352x124 (h3: 9) but 92-97 s at 1344x768: MLX 0.32's own SDPA now beats
+the attention here at that length, which makes it the next thing to port.
 
 ## Tests and runtime requirements
 
