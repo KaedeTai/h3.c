@@ -1725,7 +1725,35 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    /* HyperFlow H3 Flash samples fixed 4/6/8-step raw grids, shifted per modality like every H3 grid.
+       tools/convert_hyperflow.py leaves hyperflow.json beside its weights; an explicit H3_SIGMA_BASE wins. */
+    int hyperflow_grid = 0;
+    {
+        size_t length = strlen(dit_path) + sizeof("/hyperflow.json");
+        char *marker = malloc(length);
+        if (marker) {
+            snprintf(marker, length, "%s/hyperflow.json", dit_path);
+            hyperflow_grid = h3_is_file(marker) &&
+                !(getenv("H3_SIGMA_BASE") && *getenv("H3_SIGMA_BASE"));
+            free(marker);
+        }
+    }
+    if (hyperflow_grid) {
+        const char *grid =
+            params->steps == 4 ? "1.0,0.681872,0.205019,0.036496" :
+            params->steps == 6 ? "1.0,0.825217,0.471725,0.147401,0.049626,0.015517" :
+            params->steps == 8 ? "1.0,0.931506,0.839236,0.703462,0.5,0.296538,0.160764,0.068494" :
+            NULL;
+        if (!grid) {
+            h3_set_error(ctx, "HyperFlow H3 Flash samples 4, 6 or 8 steps, not %d (use --steps 6)",
+                         params->steps);
+            goto cleanup;
+        }
+        setenv("H3_SIGMA_BASE", grid, 1);
+    }
+    int sigma_ok = h3_serving_schedule_build(params->steps, &sigmas);
+    if (hyperflow_grid) unsetenv("H3_SIGMA_BASE");
+    if (!sigma_ok) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -1904,6 +1932,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    if (getenv("H3_DUMP_LATENT") && *getenv("H3_DUMP_LATENT")) {
+        /* Debug: the initial noise, raw F32, so another implementation can
+           start from the same point ([24,T,H,W] and [32,2,T]). */
+        char dump_path[1024];
+        snprintf(dump_path, sizeof(dump_path), "%s.noise_video",
+                 getenv("H3_DUMP_LATENT"));
+        FILE *dump = fopen(dump_path, "wb");
+        if (dump) {
+            fwrite(video, sizeof(float), video_count, dump);
+            fclose(dump);
+        }
+        snprintf(dump_path, sizeof(dump_path), "%s.noise_audio",
+                 getenv("H3_DUMP_LATENT"));
+        dump = fopen(dump_path, "wb");
+        if (dump) {
+            fwrite(audio, sizeof(float), audio_count, dump);
+            fclose(dump);
+        }
+    }
     if (want_audio_anchor && !audio_anchor) {
         h3_set_error(ctx, "H3_AUDIO_ANCHOR needs a --ref-audio clip. If this "
                           "is a conditioning-cache hit, the cached entry was "

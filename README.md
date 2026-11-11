@@ -444,6 +444,44 @@ with a LoRA. The base bundle already contains the turbo LoRA, so style
 adapters trained on the base model may want their authors' "with turbo"
 strengths.
 
+### 10. Run HyperFlow H3 Flash (few-step, 14B)
+
+[HyperFlow H3 Flash](https://huggingface.co/VideoRebirthAI/hyperflow-h3-flash)
+is MiniMax-H3 compressed into a 4/6/8-step model: three blocks removed
+(FL2VA: 6, 21, 22; Ref2VA: 9), about a hundred linears factorized, the AdaLN
+time embedding cut from 2688 to 16 wide, and two-time conditioning -- every
+AdaLN reads `temb(t, r) = e_t(t) + 0.25 (e_r(r) - e_t(t))`, `r` being the time
+the Euler step lands on. No CFG. Only the transformer changes; tokenizer, text
+encoder and VAEs are H3's.
+
+```sh
+hf download VideoRebirthAI/hyperflow-h3-flash --local-dir ~/models/hyperflow-h3-flash \
+  --include "fl2va_int8_convrot/*" --include "ref2va_int8_convrot/*"
+tools/convert_hyperflow.py --src ~/models/hyperflow-h3-flash/fl2va_int8_convrot --dst HF/FL2VA/transformer
+tools/convert_hyperflow.py --src ~/models/hyperflow-h3-flash/ref2va_int8_convrot --dst HF/Ref2VA/transformer
+for v in FL2VA Ref2VA; do for c in tokenizer text_encoder video_vae audio_vae processor model_index.json; do
+  ln -s "$PWD/MiniMax-H3-turbo-int8/FL2VA/$c" HF/$v/$c; done; done
+./h3 -d HF -p "..." --steps 6 -o outputs/hf.mp4     # 4 = fastest, 8 = closest to the base
+```
+
+The converter undoes the checkpoint's Hadamard-rotated INT8 (ConvRot),
+multiplies the low-rank factors back into dense matrices and writes every
+block matrix in this bundle's per-row int8, so the DiT runs on the existing
+int8 paths. h3 reads the rest off the weights: blocks with no weights stay
+inactive (on top of `--layers`), `endpoint_time_embedder.*` switches the AdaLN
+table to one row per `(t, r)` pair (computed on the host in double -- the
+embedding cancels heavily), and `hyperflow.json` beside the weights selects
+the step grid. `--steps` must be 4, 6 or 8; `H3_SIGMA_BASE` still overrides.
+
+Checked against the official diffusers block with HyperFlow's own linears and
+against an MLX port (`~/repos/hyperflow-h3-mlx`). From the same noise and
+text, h3's 6-step result differs from the MLX bf16 run by 19% (video latent,
+relative L2) and 16% (audio); the MLX run differs from itself at fp32 by 28%
+and 10%, so a 6-step trajectory is about that sensitive to arithmetic.
+M5 Max, 6 steps: 512x288x56 denoise 11.1 s; FL2VA 608x352x124 denoise 54.4 s
+(118 s end to end, 10.8 GB peak footprint); 1344x768x124 denoise 704 s
+(117 s a step -- attention-bound; 950 s end to end, 12.8 GB).
+
 ## Tests and runtime requirements
 
 ```sh

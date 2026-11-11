@@ -90,7 +90,7 @@ static char *single_safetensors(const char *directory, char *error,
     int count = 0;
     struct dirent *entry;
     while ((entry = readdir(stream)) != NULL) {
-        if (!ends_with(entry->d_name, ".safetensors")) continue;
+        if (entry->d_name[0] == '.' || !ends_with(entry->d_name, ".safetensors")) continue;
         count++;
         if (strlen(names) + strlen(entry->d_name) + 3 < sizeof(names)) {
             if (names[0]) strcat(names, ", ");

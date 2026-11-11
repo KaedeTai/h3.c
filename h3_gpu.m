@@ -651,7 +651,10 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
     int transformer_weight = strstr(path, "/transformer/") != NULL;
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
-    int map_weight = bytes && !force_copy &&
+    /* Only payloads that start on a 16-byte boundary are mapped: a buffer made over a misaligned payload reads
+       F32 values from the wrong address. safetensors pads its header to 8 bytes, but not every writer does
+       (MLX's leaves an odd header length, so every payload sits at 2 mod 4); those are copied instead. */
+    int map_weight = bytes && !force_copy && (file_offset % 16) == 0 &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
          (transformer_weight &&
           ((zero_copy && !strcmp(zero_copy, "transformer")) ||

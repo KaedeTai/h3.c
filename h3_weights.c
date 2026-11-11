@@ -25,6 +25,9 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
 static int safetensors_name(const char *name) {
     static const char suffix[] = ".safetensors";
     size_t length = strlen(name);
+    /* Hidden files are never shards: macOS writes ._name AppleDouble companions next to every file on an
+       exFAT/FAT volume, and they share the .safetensors suffix. */
+    if (name[0] == '.') return 0;
     return length > sizeof(suffix) - 1 &&
            strcmp(name + length - (sizeof(suffix) - 1), suffix) == 0;
 }

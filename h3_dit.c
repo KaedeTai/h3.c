@@ -1306,6 +1306,25 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+/* HyperFlow H3 Flash removes some blocks outright and ships no weights for them: they stay inactive on top of
+ * whatever --layers chose. A released bundle has every block, so nothing changes for it. */
+static void deactivate_missing_blocks(h3_dit *dit) {
+    unsigned active = 0, missing = 0;
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        char name[64];
+        snprintf(name, sizeof(name), "blocks.%u.norm1.weight", block);
+        if (!h3_weight_find(dit->weights, name, NULL)) {
+            dit->block_active[block] = 0;
+            missing++;
+        }
+        active += dit->block_active[block] != 0;
+    }
+    if (missing && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: %u DiT blocks absent from the checkpoint, %u active\n",
+                missing, active);
+    dit->active_block_count = active;
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
@@ -1753,6 +1772,7 @@ static h3_dit *load_dit(const char *weight_directory,
         error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
+        deactivate_missing_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
                               H3_DIT_BLOCKS);
     }
@@ -2301,6 +2321,29 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
+        if (getenv("H3_DEBUG_NAN") && !dit->ssd_streaming) {
+            OP(h3_gpu_submit(dit->gpu), "debug submit");
+            const h3_gpu_tensor *probe[] = {dit->hidden, dit->refined_text};
+            const char *names[] = {"hidden (input)", "refined text"};
+            for (int t = 0; t < 2; t++) {
+                if (!probe[t]) continue;
+                size_t count = h3_gpu_tensor_elements(probe[t]);
+                uint16_t *values = malloc(count * sizeof(*values));
+                if (values && h3_gpu_tensor_read_bf16(probe[t], values, count)) {
+                    size_t bad = 0, first = (size_t)-1; double total = 0.0;
+                    for (size_t i = 0; i < count; i++) {
+                        uint32_t bits = (uint32_t)values[i] << 16; float v;
+                        memcpy(&v, &bits, sizeof(v));
+                        if (!isfinite(v)) { bad++; if (first == (size_t)-1) first = i; }
+                        else total += fabs((double)v);
+                    }
+                    fprintf(stderr, "h3: step %d %s: %zu values, %zu non-finite (first row %zu), mean|x| %.4g\n",
+                            step, names[t], count, bad, first == (size_t)-1 ? 0 : first / HIDDEN, total / (double)count);
+                }
+                free(values);
+            }
+            OP(h3_gpu_begin(dit->gpu), "debug begin");
+        }
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             int fused_token_adaln = carried_attention_adaln;
             int fused_attention_input_quantized =
@@ -2394,6 +2437,24 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 completed_blocks < dit->active_block_count &&
                 completed_blocks % command_blocks == 0)
                 OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
+            if (getenv("H3_DEBUG_NAN") && !dit->ssd_streaming) {
+                /* Debug: synchronise after every block and report the residual stream. */
+                OP(h3_gpu_submit(dit->gpu), "debug submit");
+                size_t count = h3_gpu_tensor_elements(dit->hidden);
+                uint16_t *values = malloc(count * sizeof(*values));
+                if (values && h3_gpu_tensor_read_bf16(dit->hidden, values, count)) {
+                    size_t bad = 0; double total = 0.0;
+                    for (size_t i = 0; i < count; i++) {
+                        uint32_t bits = (uint32_t)values[i] << 16; float v;
+                        memcpy(&v, &bits, sizeof(v));
+                        if (!isfinite(v)) bad++; else total += fabs((double)v);
+                    }
+                    fprintf(stderr, "h3: step %d block %u: hidden %zu non-finite, mean|x| %.4g\n",
+                            step, block, bad, total / (double)count);
+                }
+                free(values);
+                OP(h3_gpu_begin(dit->gpu), "debug begin");
+            }
             if (stream_started) {
                 int gpu_ok = gpu_op(dit, h3_gpu_submit(dit->gpu),
                                     error, error_size,
