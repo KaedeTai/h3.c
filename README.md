@@ -480,11 +480,17 @@ relative L2) and 16% (audio); the MLX run differs from itself at fp32 by 28%
 and 10%, so a 6-step trajectory is about that sensitive to arithmetic.
 M5 Max, 6 steps: 512x288x56 denoise 11.1 s; FL2VA 608x352x124 denoise 54.4 s
 (118 s end to end, 10.8 GB peak footprint); 1344x768x124 denoise 704 s
-(117 s a step -- attention-bound; 950 s end to end, 12.8 GB). At 1344x768
-the opt-in attentions are slower still: `H3_STEEL_ATTN=1` 127 s a step,
-`H3_INT8_ATTN=1` 140 s. The MLX port runs the same model at 17 s a step at
-608x352x124 (h3: 9) but 92-97 s at 1344x768: MLX 0.32's own SDPA now beats
-the attention here at that length, which makes it the next thing to port.
+(950 s end to end, 12.8 GB) in one sustained run. Started cool (2 min idle,
+2 steps) the same 1344x768x124 step takes 82.6 s, of which 67.5 s is the 47
+attentions over 37,730 tokens (1.44 s each, 28 TFLOPS) and 15.2 s everything
+else; the 117 s a step of the long run is most likely the machine heating up.
+The MLX port, measured the same way, takes 89-95 s a step and 36.5 GB, and
+17 s a step at 608x352x124 (h3: 9). The attention kernels are not the
+difference: `tools/bench/sdpa_bench.c` times the default MPSGraph path at
+1.39-1.45 s for N=37730, 56x128, and the steel NAX path (`H3_STEEL_ATTN=1`,
+the same source as MLX 0.32.2's steel_attention_nax) at 1.50-1.73 s, against
+1.51 s for MLX's own SDPA at 38,912 tokens. At 1344x768 `H3_STEEL_ATTN=1` (127 s a step in the
+sustained run) and `H3_INT8_ATTN=1` (140 s) stay slower than the default.
 
 ## Tests and runtime requirements
 
