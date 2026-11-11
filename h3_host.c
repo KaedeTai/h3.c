@@ -114,6 +114,26 @@ int h3_reference_video_canvas(int width, int height,
     return 1;
 }
 
+double h3_audio_sigma_shift(void) {
+    static double cached = 0.0;
+    if (cached > 0.0) return cached;
+    double value = H3_AUDIO_SIGMA_SHIFT_DEFAULT;
+    const char *text = getenv("H3_AUDIO_SIGMA_SHIFT");
+    if (text && *text) {
+        char *end = NULL;
+        double parsed = strtod(text, &end);
+        if (end != text && !*end && parsed > 0.0 && parsed < 100.0) {
+            value = parsed;
+            fprintf(stderr, "h3: audio sigma shift %.3f (H3_AUDIO_SIGMA_SHIFT)\n",
+                    value);
+        } else {
+            fprintf(stderr, "h3: ignoring H3_AUDIO_SIGMA_SHIFT=%s\n", text);
+        }
+    }
+    cached = value;
+    return cached;
+}
+
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift) {
     double base = sigma / (from_shift + sigma * (1.0 - from_shift));
     return to_shift * base / (1.0 + (to_shift - 1.0) * base);

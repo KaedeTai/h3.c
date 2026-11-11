@@ -121,6 +121,12 @@
  * Pipelines are specialised per (kernel, align_Q, align_K) through function constants. */
 @property(nonatomic, strong) id<MTLLibrary> steelLibrary;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *steelPipelines;
+/* Sol-Attn block-sparse attention for the next SDPA call (h3_gpu_set_sol), and its scratch buffers. */
+@property(nonatomic) BOOL solArmed;
+@property(nonatomic) float solTau;
+@property(nonatomic) uint32_t solDenseEnd;
+@property(nonatomic) uint32_t solTokensPerFrame;
+@property(nonatomic, strong) NSMutableArray<id<MTLBuffer>> *solBuffers;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
@@ -375,7 +381,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                                                    options:options
                                                      error:&libraryError];
             gpu.tensorOpsEnabled = gpu.library && wantsTensorOps;
-            if (gpu.tensorOpsEnabled && getenv("H3_STEEL_ATTN")) {
+            if (gpu.tensorOpsEnabled && (getenv("H3_STEEL_ATTN") || getenv("H3_INT8_ATTN") ||
+                                         (getenv("H3_SOL_TAU") && *getenv("H3_SOL_TAU")))) {
                 NSString *steelPath = [[path stringByDeletingLastPathComponent]
                     stringByAppendingPathComponent:@"steel/h3_steel_attention.metal"];
                 if (![path containsString:@"/"])
@@ -1780,6 +1787,214 @@ static int h3_gpu_sdpa_steel(H3GPU *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
+/* ---- Sol-Attn block-sparse self-attention (steel library: h3_sol_* kernels) ---- */
+typedef struct {
+    int32_t H, N, nb, D;
+    int64_t in_s_h, in_s_t;
+    int64_t out_s_h, out_s_t;
+    float scale;
+    float tau;
+    int32_t dense_end;
+    int32_t tokens_per_frame;
+} h3_sol_params;
+
+void h3_gpu_set_sol(h3_gpu *opaque, int enabled, float tau, uint32_t dense_end,
+                    uint32_t tokens_per_frame) {
+    H3GPU *gpu = GPU(opaque);
+    gpu.solArmed = enabled != 0;
+    gpu.solTau = tau;
+    gpu.solDenseEnd = dense_end;
+    gpu.solTokensPerFrame = tokens_per_frame;
+}
+
+static id<MTLComputePipelineState> h3_gpu_sol_pipeline(H3GPU *gpu, NSString *name) {
+    id<MTLComputePipelineState> pipeline = gpu.steelPipelines[name];
+    if (pipeline) return pipeline;
+    NSError *error = nil;
+    id<MTLFunction> function = [gpu.steelLibrary newFunctionWithName:name];
+    pipeline = function ? [gpu.device newComputePipelineStateWithFunction:function error:&error] : nil;
+    if (!pipeline) {
+        h3_gpu_set_error(gpu, @"Sol attention pipeline %@: %@", name,
+                         error ? error.localizedDescription : @"function not found");
+        return nil;
+    }
+    gpu.steelPipelines[name] = pipeline;
+    return pipeline;
+}
+
+static id<MTLBuffer> h3_gpu_sol_buffer(H3GPU *gpu, NSUInteger slot, NSUInteger bytes) {
+    if (!gpu.solBuffers) gpu.solBuffers = [NSMutableArray array];
+    while (gpu.solBuffers.count <= slot) [gpu.solBuffers addObject:(id<MTLBuffer>)[NSNull null]];
+    id existing = gpu.solBuffers[slot];
+    if (existing != [NSNull null] && ((id<MTLBuffer>)existing).length >= bytes) return existing;
+    id<MTLBuffer> buffer = [gpu.device newBufferWithLength:MAX(bytes, 16)
+                                                   options:MTLResourceStorageModePrivate];
+    if (buffer) gpu.solBuffers[slot] = buffer;
+    return buffer;
+}
+
+static int h3_gpu_sdpa_sol(H3GPU *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value, uint32_t sequence,
+                           uint32_t heads, uint32_t head_dim, float scale,
+                           int inputHeadMajor, int outputHeadMajor) {
+    id<MTLComputePipelineState> sums = h3_gpu_sol_pipeline(gpu, @"h3_sol_block_sums");
+    id<MTLComputePipelineState> kstats = h3_gpu_sol_pipeline(gpu, @"h3_sol_kstats");
+    id<MTLComputePipelineState> route = h3_gpu_sol_pipeline(gpu, @"h3_sol_route");
+    id<MTLComputePipelineState> attn = h3_gpu_sol_pipeline(gpu, @"h3_sol_attention_bd128");
+    if (!sums || !kstats || !route || !attn) return 0;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    const int64_t N = sequence, H = heads, D = head_dim;
+    const int64_t nb = (N + 63) / 64;
+    h3_sol_params p = {
+        .H = (int32_t)H, .N = (int32_t)N, .nb = (int32_t)nb, .D = (int32_t)D,
+        .in_s_h = inputHeadMajor ? N * D : D, .in_s_t = inputHeadMajor ? D : H * D,
+        .out_s_h = outputHeadMajor ? N * D : D, .out_s_t = outputHeadMajor ? D : H * D,
+        .scale = scale, .tau = gpu.solTau,
+        .dense_end = (int32_t)gpu.solDenseEnd, .tokens_per_frame = (int32_t)gpu.solTokensPerFrame,
+    };
+    id<MTLBuffer> qc = h3_gpu_sol_buffer(gpu, 0, (NSUInteger)(H * nb * D * 4));
+    id<MTLBuffer> kc = h3_gpu_sol_buffer(gpu, 1, (NSUInteger)(H * nb * D * 4));
+    id<MTLBuffer> kcb = h3_gpu_sol_buffer(gpu, 2, (NSUInteger)(H * nb * D * 2));
+    id<MTLBuffer> vm = h3_gpu_sol_buffer(gpu, 3, (NSUInteger)(H * nb * D * 2));
+    id<MTLBuffer> kmean = h3_gpu_sol_buffer(gpu, 4, (NSUInteger)(H * D * 4));
+    id<MTLBuffer> kvar = h3_gpu_sol_buffer(gpu, 5, (NSUInteger)(H * D * 4));
+    id<MTLBuffer> rt = h3_gpu_sol_buffer(gpu, 6, (NSUInteger)(H * nb * nb));
+    id<MTLBuffer> kidx = h3_gpu_sol_buffer(gpu, 7, (NSUInteger)(H * nb * nb * 4));
+    id<MTLBuffer> kcnt = h3_gpu_sol_buffer(gpu, 8, (NSUInteger)(H * nb * 4));
+    if (!qc || !kc || !kcb || !vm || !kmean || !kvar || !rt || !kidx || !kcnt) {
+        h3_gpu_set_error(gpu, @"Sol attention: out of GPU memory for routing buffers");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = [gpu.command computeCommandEncoder];
+        [e setComputePipelineState:sums];
+        [e setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [e setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [e setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [e setBuffer:qc offset:0 atIndex:3];
+        [e setBuffer:kc offset:0 atIndex:4];
+        [e setBuffer:kcb offset:0 atIndex:5];
+        [e setBuffer:vm offset:0 atIndex:6];
+        [e setBytes:&p length:sizeof(p) atIndex:7];
+        [e dispatchThreads:MTLSizeMake((NSUInteger)D, (NSUInteger)nb, (NSUInteger)H)
+            threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)D, 128), 1, 1)];
+        [e setComputePipelineState:kstats];
+        [e setBuffer:kc offset:0 atIndex:0];
+        [e setBuffer:kmean offset:0 atIndex:1];
+        [e setBuffer:kvar offset:0 atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e dispatchThreads:MTLSizeMake((NSUInteger)D, (NSUInteger)H, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)D, 128), 1, 1)];
+        [e setComputePipelineState:route];
+        [e setBuffer:qc offset:0 atIndex:0];
+        [e setBuffer:kc offset:0 atIndex:1];
+        [e setBuffer:kmean offset:0 atIndex:2];
+        [e setBuffer:kvar offset:0 atIndex:3];
+        [e setBuffer:rt offset:0 atIndex:4];
+        [e setBuffer:kidx offset:0 atIndex:5];
+        [e setBuffer:kcnt offset:0 atIndex:6];
+        [e setBytes:&p length:sizeof(p) atIndex:7];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nb, (NSUInteger)H, 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [e setComputePipelineState:attn];
+        [e setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [e setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [e setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [e setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [e setBuffer:kcb offset:0 atIndex:4];
+        [e setBuffer:vm offset:0 atIndex:5];
+        [e setBuffer:rt offset:0 atIndex:6];
+        [e setBuffer:kidx offset:0 atIndex:7];
+        [e setBuffer:kcnt offset:0 atIndex:8];
+        [e setBytes:&p length:sizeof(p) atIndex:9];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nb, (NSUInteger)H, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        [e endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 4;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* ---- int8 QK^T attention (H3_INT8_ATTN=1; steel library: h3_sage_* kernels) ---- */
+typedef struct {
+    int32_t H, N, Npad, D;
+    int64_t in_s_h, in_s_t;
+    int64_t out_s_h, out_s_t;
+    float scale;
+} h3_sage_params;
+
+static int h3_gpu_sdpa_sage(H3GPU *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                            const h3_gpu_tensor *value, uint32_t sequence,
+                            uint32_t heads, uint32_t head_dim, float scale,
+                            int inputHeadMajor, int outputHeadMajor) {
+    id<MTLComputePipelineState> kmean = h3_gpu_sol_pipeline(gpu, @"h3_sage_kmean");
+    id<MTLComputePipelineState> quant = h3_gpu_sol_pipeline(gpu, @"h3_sage_quant");
+    id<MTLComputePipelineState> attn = h3_gpu_sol_pipeline(gpu, @"h3_sage_attention_bd128");
+    if (!kmean || !quant || !attn) return 0;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    const int64_t N = sequence, H = heads, D = head_dim;
+    const int64_t Npad = (N + 63) / 64 * 64;
+    h3_sage_params p = {
+        .H = (int32_t)H, .N = (int32_t)N, .Npad = (int32_t)Npad, .D = (int32_t)D,
+        .in_s_h = inputHeadMajor ? N * D : D, .in_s_t = inputHeadMajor ? D : H * D,
+        .out_s_h = outputHeadMajor ? N * D : D, .out_s_t = outputHeadMajor ? D : H * D,
+        .scale = scale,
+    };
+    id<MTLBuffer> km = h3_gpu_sol_buffer(gpu, 10, (NSUInteger)(H * D * 4));
+    id<MTLBuffer> qi = h3_gpu_sol_buffer(gpu, 11, (NSUInteger)(H * Npad * D));
+    id<MTLBuffer> ki = h3_gpu_sol_buffer(gpu, 12, (NSUInteger)(H * Npad * D));
+    id<MTLBuffer> qs = h3_gpu_sol_buffer(gpu, 13, (NSUInteger)(H * (Npad / 16) * 4));
+    id<MTLBuffer> ks = h3_gpu_sol_buffer(gpu, 14, (NSUInteger)(H * (Npad / 16) * 4));
+    if (!km || !qi || !ki || !qs || !ks) {
+        h3_gpu_set_error(gpu, @"int8 attention: out of GPU memory");
+        return 0;
+    }
+    int smooth0 = 0, smooth1 = 1;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = [gpu.command computeCommandEncoder];
+        [e setComputePipelineState:kmean];
+        [e setBuffer:TENSOR(key).buffer offset:0 atIndex:0];
+        [e setBuffer:km offset:0 atIndex:1];
+        [e setBytes:&p length:sizeof(p) atIndex:2];
+        [e dispatchThreads:MTLSizeMake((NSUInteger)D, (NSUInteger)H, 1)
+            threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)D, 128), 1, 1)];
+        [e setComputePipelineState:quant];
+        [e setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [e setBuffer:km offset:0 atIndex:1];
+        [e setBuffer:qi offset:0 atIndex:2];
+        [e setBuffer:qs offset:0 atIndex:3];
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e setBytes:&smooth0 length:sizeof(int) atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(Npad / 16), (NSUInteger)H, 1)
+          threadsPerThreadgroup:MTLSizeMake((NSUInteger)D, 1, 1)];
+        [e setBuffer:TENSOR(key).buffer offset:0 atIndex:0];
+        [e setBuffer:ki offset:0 atIndex:2];
+        [e setBuffer:ks offset:0 atIndex:3];
+        [e setBytes:&smooth1 length:sizeof(int) atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(Npad / 16), (NSUInteger)H, 1)
+          threadsPerThreadgroup:MTLSizeMake((NSUInteger)D, 1, 1)];
+        [e setComputePipelineState:attn];
+        [e setBuffer:qi offset:0 atIndex:0];
+        [e setBuffer:ki offset:0 atIndex:1];
+        [e setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [e setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [e setBuffer:qs offset:0 atIndex:4];
+        [e setBuffer:ks offset:0 atIndex:5];
+        [e setBytes:&p length:sizeof(p) atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)(Npad / 64), (NSUInteger)H, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        [e endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 4;
+    gpu.stats = stats;
+    return 1;
+}
+
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
@@ -1808,6 +2023,18 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
     static int skip_attn = -1;
     if (skip_attn < 0) skip_attn = getenv("H3_SKIP_ATTN") != NULL;
     if (skip_attn) return 1;
+    BOOL sol = gpu.solArmed;
+    gpu.solArmed = NO;
+    if (sol && gpu.steelLibrary && tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
+        head_dim == 128 && sequence >= 4096)
+        return h3_gpu_sdpa_sol(gpu, output, query, key, value, sequence, heads,
+                               head_dim, scale, headMajor, outputHeadMajor);
+    static int int8_attn = -1;
+    if (int8_attn < 0) int8_attn = getenv("H3_INT8_ATTN") && strcmp(getenv("H3_INT8_ATTN"), "0") != 0;
+    if (int8_attn && gpu.steelLibrary && tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
+        head_dim == 128 && sequence >= 4096)
+        return h3_gpu_sdpa_sage(gpu, output, query, key, value, sequence, heads,
+                                head_dim, scale, headMajor, outputHeadMajor);
     if (gpu.steelLibrary && tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal &&
         (head_dim == 64 || head_dim == 96 || head_dim == 128))
         return h3_gpu_sdpa_steel(gpu, output, query, key, value, sequence, heads,

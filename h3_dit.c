@@ -115,6 +115,8 @@ struct h3_dit {
     int audio_anchor_clean;
     /* See h3_dit_set_start_step. */
     int start_step;
+    /* See h3_dit_set_noise_seed. */
+    uint64_t noise_seed;
     unsigned core_forward_count;
     int core_residual_ready;
     unsigned active_block_count;
@@ -2002,6 +2004,30 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+    {
+        /* H3_SOL_TAU=tau[,tau,...] (one per step, last repeats): Sol-Attn block-sparse self-attention in
+           blocks >= H3_SOL_DENSE_LAYERS (default 1). Text and audio rows stay dense. */
+        static int sol_init = 0, sol_dense_layers = 1, sol_n = 0;
+        static float sol_taus[16];
+        if (!sol_init) {
+            const char *v = getenv("H3_SOL_TAU");
+            while (v && *v && sol_n < 16) {
+                char *end = NULL;
+                float t = strtof(v, &end);
+                if (end == v) break;
+                sol_taus[sol_n++] = t;
+                v = (*end == ',') ? end + 1 : end;
+            }
+            const char *d = getenv("H3_SOL_DENSE_LAYERS");
+            if (d && *d) sol_dense_layers = atoi(d);
+            sol_init = 1;
+        }
+        int use_sol = sol_n > 0 && (int)index >= sol_dense_layers &&
+            !dit->token_reduction_active && !dit->core_reuse_audio_pass;
+        float tau = sol_n ? sol_taus[step < sol_n ? step : sol_n - 1] : 0.0f;
+        h3_gpu_set_sol(dit->gpu, use_sol, tau, dit->video_target_start,
+                       (uint32_t)(dit->latent_h / 2) * (uint32_t)(dit->latent_w / 2));
+    }
     if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
@@ -2672,8 +2698,18 @@ static int parse_reuse_steps(int steps, uint8_t *selected) {
     return selected[0] && selected[steps - 1] ? count : -1;
 }
 
+/* H3_RENOISE=1: the DMD-style multistep rule few-step students (DMAD) are
+   trained with. Each step predicts x0 = x + sigma * v and then draws fresh
+   noise at the next sigma, x' = (1 - s') x0 + s' eps, instead of the Euler
+   ODE step. Host-side only. */
+static int renoise_requested(void) {
+    const char *value = getenv("H3_RENOISE");
+    return value && *value && strcmp(value, "0");
+}
+
 static int gpu_sampler_requested(const h3_dit *dit) {
     if (dit->audio_anchor) return 0;   /* anchor is host-side for now */
+    if (renoise_requested()) return 0;
     const char *cpu = getenv("H3_CPU_SAMPLER");
     if (cpu && *cpu && strcmp(cpu, "0")) return 0;
     const char *value = getenv("H3_GPU_SAMPLER");
@@ -2971,6 +3007,10 @@ void h3_dit_set_start_step(h3_dit *dit, int step) {
     if (dit && step >= 0 && step < dit->sigmas.steps) dit->start_step = step;
 }
 
+void h3_dit_set_noise_seed(h3_dit *dit, uint64_t seed) {
+    if (dit) dit->noise_seed = seed;
+}
+
 int h3_dit_denoise_euler_preview(
                          h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
@@ -3051,6 +3091,19 @@ int h3_dit_denoise_euler_preview(
             fprintf(stderr, "h3: audio anchor active, %zu latent elements\n",
                     audio_count);
     }
+    int renoise = renoise_requested();
+    if (renoise && (reuse_interval > 1 || dit->audio_anchor)) {
+        fprintf(stderr, "h3: H3_RENOISE ignored with step reuse or an audio "
+                "anchor\n");
+        renoise = 0;
+    }
+    h3_rng renoise_rng;
+    if (renoise) {
+        /* Its own stream, distinct from the two initial-noise generators that
+           share the requested seed. */
+        h3_rng_seed(&renoise_rng, dit->noise_seed ^ UINT64_C(0xd1ad5eed0b5e55ed));
+        fprintf(stderr, "h3: re-noise sampler (%d steps)\n", dit->sigmas.steps);
+    }
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
@@ -3089,7 +3142,20 @@ int h3_dit_denoise_euler_preview(
                     ? dit->sigmas.audio[previous_evaluated] : 0.0f,
                 previous_evaluated >= 0);
         }
-        if (ok) {
+        if (ok && renoise) {
+            float vs = dit->sigmas.video[step], vn = dit->sigmas.video[step + 1];
+            float as = dit->sigmas.audio[step], an = dit->sigmas.audio[step + 1];
+            for (size_t i = 0; i < video_count; i++) {
+                float x0 = video_latent[i] + vs * video_velocity[i];
+                video_latent[i] = vn > 0.0f
+                    ? (1.0f - vn) * x0 + vn * h3_rng_normal(&renoise_rng) : x0;
+            }
+            for (size_t i = 0; i < audio_count; i++) {
+                float x0 = audio_latent[i] + as * audio_velocity[i];
+                audio_latent[i] = an > 0.0f
+                    ? (1.0f - an) * x0 + an * h3_rng_normal(&renoise_rng) : x0;
+            }
+        } else if (ok) {
             ok = h3_euler_velocity_step(
                      video_latent, video_velocity, video_count,
                      dit->sigmas.video[step], dit->sigmas.video[step + 1]) &&

@@ -2199,3 +2199,444 @@ template <
 h3_instantiate_attn(bfloat16, bfloat16_t, 64, 32, 96, 4, 1)
 h3_instantiate_attn(bfloat16, bfloat16_t, 64, 32, 64, 4, 1)
 h3_instantiate_attn(bfloat16, bfloat16_t, 64, 32, 128, 4, 1)
+
+
+// ===== Sol-Attn block-sparse self-attention (port of sol-refiner-mlx/sparse_nax.py) =====
+// Routing per 64-token block (NVIDIA Sol-Attn "diag" threshold, ltx-2-mlx build_route): a query block attends exactly
+// to the key blocks whose centroid score passes mean + tau * std, its neighbours (|i - j| <= 1), the blocks one video
+// frame before / after, and every block holding text or audio tokens (rows and columns, [0, dense_end)); every other
+// block enters the softmax once, as its key centroid with a log2(length) bias and its value mean.
+// The attention loop is MLX's NAX one (BQ 64 = one routing block, BK 32, 4 simdgroups, (32, 4, 1) threadgroups).
+
+struct h3_sol_params {
+  int H, N, nb, D;
+  int64_t in_s_h, in_s_t;
+  int64_t out_s_h, out_s_t;
+  float scale;
+  float tau;
+  int dense_end;
+  int tokens_per_frame;
+};
+
+// grid (D, nb, H) threads: per head and block, centroids of q and k (fp32), k centroid and v mean in bf16
+kernel void h3_sol_block_sums(
+    const device bfloat16_t* q [[buffer(0)]], const device bfloat16_t* k [[buffer(1)]],
+    const device bfloat16_t* v [[buffer(2)]], device float* qc [[buffer(3)]], device float* kc [[buffer(4)]],
+    device bfloat16_t* kcb [[buffer(5)]], device bfloat16_t* vm [[buffer(6)]],
+    constant h3_sol_params& p [[buffer(7)]], uint3 gid [[thread_position_in_grid]]) {
+  const int d = gid.x, c = gid.y, h = gid.z;
+  if (d >= p.D || c >= p.nb || h >= p.H) return;
+  const int t0 = c * 64, t1 = min(t0 + 64, p.N);
+  const int64_t base = int64_t(h) * p.in_s_h + d;
+  float sq = 0.0f, sk = 0.0f, sv = 0.0f;
+  for (int t = t0; t < t1; t++) {
+    const int64_t o = base + int64_t(t) * p.in_s_t;
+    sq += float(q[o]); sk += float(k[o]); sv += float(v[o]);
+  }
+  const float inv = 1.0f / float(t1 - t0);
+  const int64_t idx = (int64_t(h) * p.nb + c) * p.D + d;
+  qc[idx] = sq * inv;
+  kc[idx] = sk * inv;
+  kcb[idx] = bfloat16_t(sk * inv);
+  vm[idx] = bfloat16_t(sv * inv);
+}
+
+// grid (D, H) threads: mean and variance of the key centroids over blocks
+kernel void h3_sol_kstats(
+    const device float* kc [[buffer(0)]], device float* kmean [[buffer(1)]], device float* kvar [[buffer(2)]],
+    constant h3_sol_params& p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+  const int d = gid.x, h = gid.y;
+  if (d >= p.D || h >= p.H) return;
+  float s = 0.0f, s2 = 0.0f;
+  for (int c = 0; c < p.nb; c++) { const float x = kc[(int64_t(h) * p.nb + c) * p.D + d]; s += x; s2 += x * x; }
+  const float m = s / float(p.nb);
+  kmean[h * p.D + d] = m;
+  kvar[h * p.D + d] = max(s2 / float(p.nb) - m * m, 0.0f);
+}
+
+METAL_FUNC int h3_sol_floordiv64(int x) { return x >= 0 ? x / 64 : -((-x + 63) / 64); }
+
+// threadgroup (128) per (query block i, head h): route row + compact ascending list of routed blocks
+kernel void h3_sol_route(
+    const device float* qc [[buffer(0)]], const device float* kc [[buffer(1)]],
+    const device float* kmean [[buffer(2)]], const device float* kvar [[buffer(3)]],
+    device uint8_t* route [[buffer(4)]], device int* kidx [[buffer(5)]], device int* kcnt [[buffer(6)]],
+    constant h3_sol_params& p [[buffer(7)]], uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]) {
+  const int i = tg.x, h = tg.y, nb = p.nb, D = p.D;
+  const device float* qi = qc + (int64_t(h) * nb + i) * D;
+  threadgroup float red[2][4];
+  float rm = 0.0f, rv = 0.0f;
+  for (int d = tid; d < D; d += 128) {
+    const float x = qi[d];
+    rm += x * kmean[h * D + d];
+    rv += x * x * kvar[h * D + d];
+  }
+  rm = simd_sum(rm); rv = simd_sum(rv);
+  if (lane == 0) { red[0][sgid] = rm; red[1][sgid] = rv; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  rm = red[0][0] + red[0][1] + red[0][2] + red[0][3];
+  rv = red[1][0] + red[1][1] + red[1][2] + red[1][3];
+  const float l2 = p.scale * M_LOG2E_F;
+  const float thr = rm * l2 + p.tau * sqrt(max(rv, 0.0f) * l2 * l2 + 1e-6f);
+  device uint8_t* R = route + (int64_t(h) * nb + i) * nb;
+  const bool dense_row = i * 64 < p.dense_end;
+  const int fpf = p.tokens_per_frame;
+  for (int j = tid; j < nb; j += 128) {
+    bool r = dense_row || j * 64 < p.dense_end || abs(i - j) <= 1;
+    if (!r && fpf > 0) {
+      for (int sgn = -1; sgn <= 1 && !r; sgn += 2) {
+        const int dd = sgn * fpf;
+        const bool valid = (i * 64 + dd < p.N) && (i * 64 + 63 + dd >= 0);
+        const int lo = clamp(h3_sol_floordiv64(i * 64 + dd), 0, nb - 1);
+        const int hi = clamp(h3_sol_floordiv64(min(i * 64 + 63, p.N - 1) + dd), 0, nb - 1);
+        r = valid && j >= lo && j <= hi;
+      }
+    }
+    if (!r) {
+      const device float* kj = kc + (int64_t(h) * nb + j) * D;
+      float s = 0.0f;
+      for (int d = 0; d < D; d++) s += qi[d] * kj[d];
+      r = s * l2 > thr;
+    }
+    R[j] = r ? 1 : 0;
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  if (tid == 0) {
+    device int* L = kidx + (int64_t(h) * nb + i) * nb;
+    int n = 0;
+    for (int j = 0; j < nb; j++) if (R[j]) L[n++] = j;
+    kcnt[h * nb + i] = n;
+  }
+}
+
+template <bool CENT, bool SAFE, int BD, typename OT>
+METAL_FUNC void h3_sol_tile(
+    const device bfloat16_t* kp, const device bfloat16_t* vp, const int kld, const int vld, const int rem,
+    const int c0, const int nb, const int N, const device uint8_t* R, const float scale2,
+    const device bfloat16_t* Qp, const int qld, const int lim_q, thread OT& Ot,
+    thread metal::vec<float, 2>& max_score, thread metal::vec<float, 2>& sum_score) {
+  typedef bfloat16_t T;
+  constexpr short kU = 16;
+  constexpr short TD = BD / kU;
+  constexpr short BK = 32;
+  using stile_t = NAXTile<float, 1, 2>;
+  constexpr float neg_inf = Limits<float>::finite_min;
+  stile_t S;
+  S.clear();
+#pragma clang loop unroll_count(4)
+  for (short id = 0; id < TD; id++) {
+    NAXTile<T, 2, 1> Kt;
+    if (SAFE) { Kt.load_rows(kp + id * kU, kld, short(rem)); } else { Kt.load(kp + id * kU, kld); }
+    NAXTile<T, 1, 1> Qf;
+    if (lim_q < kU) { Qf.load_rows(Qp + id * kU, qld, short(lim_q)); } else { Qf.load(Qp + id * kU, qld); }
+    stile_t::NAXFrag_t::mma(S.frag_at(0, 0), S.frag_at(0, 1), Qf.frag_at(0, 0), metal::false_type{},
+                            Kt.frag_at(0, 0), Kt.frag_at(1, 0), metal::true_type{});
+  }
+  STEEL_PRAGMA_UNROLL
+  for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) { S.elems()[ii] *= scale2; }
+  const short sn = stile_t::NAXFrag_t::get_coord().x;
+  if (CENT) {
+    STEEL_PRAGMA_UNROLL
+    for (short ik = 0; ik < 2; ik++) {
+      thread auto& fg = S.frag_at(0, ik);
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < 2; ii++) {
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < 4; jj++) {
+          const int c = c0 + ik * kU + sn + jj;
+          const short loc = ii * 4 + jj;
+          fg[loc] = (c >= nb || R[c]) ? neg_inf : fg[loc] + metal::log2(float(min(64, N - c * 64)));
+        }
+      }
+    }
+  } else if (SAFE) {
+    STEEL_PRAGMA_UNROLL
+    for (short ik = 0; ik < 2; ik++) {
+      thread auto& fg = S.frag_at(0, ik);
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < 2; ii++) {
+        STEEL_PRAGMA_UNROLL
+        for (short jj = 0; jj < 4; jj++) {
+          if (ik * kU + sn + jj >= rem) { fg[ii * 4 + jj] = neg_inf; }
+        }
+      }
+    }
+  }
+  metal::vec<float, 2> new_max = max_score;
+  S.template row_reduce<MaxOp>(new_max);
+  S.template row_bin_op<ExpSubOp>(new_max);
+  metal::vec<float, 2> factor;
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < 2; ++i) {
+    factor[i] = fast::exp2(max_score[i] - new_max[i]);
+    max_score[i] = new_max[i];
+    sum_score[i] *= factor[i];
+  }
+  S.template row_reduce<SumOp>(sum_score);
+  Ot.template row_bin_op<MulOp>(factor);
+  simdgroup_barrier(mem_flags::mem_none);
+  STEEL_PRAGMA_UNROLL
+  for (short id = 0; id < TD; id += 2) {
+    if (BD == 128 && id == 4) { threadgroup_barrier(mem_flags::mem_none); }
+    STEEL_PRAGMA_UNROLL
+    for (short ik = 0; ik < 2; ik++) {
+      NAXTile<T, 1, 2> Vt;
+      const device T* vsrc = vp + ik * kU * vld + id * kU;
+      if (SAFE) { Vt.load_rows(vsrc, vld, short(rem - ik * kU)); } else { Vt.load(vsrc, vld); }
+      OT::NAXFrag_t::mma(Ot.frag_at(0, id), Ot.frag_at(0, id + 1), S.frag_at(0, ik), metal::false_type{},
+                         Vt.frag_at(0, 0), Vt.frag_at(0, 1), metal::false_type{});
+    }
+  }
+}
+
+// threadgroups (ceil(N / 64), H), threads (32, 4, 1)
+template <int BD>
+[[kernel, max_total_threads_per_threadgroup(128)]] void h3_sol_attention(
+    const device bfloat16_t* q [[buffer(0)]], const device bfloat16_t* k [[buffer(1)]],
+    const device bfloat16_t* v [[buffer(2)]], device bfloat16_t* out [[buffer(3)]],
+    const device bfloat16_t* kc [[buffer(4)]], const device bfloat16_t* vc [[buffer(5)]],
+    const device uint8_t* route [[buffer(6)]], const device int* kidx [[buffer(7)]],
+    const device int* kcnt [[buffer(8)]], constant h3_sol_params& p [[buffer(9)]],
+    uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {
+  constexpr short kU = 16;
+  constexpr int BQ = 64;
+  constexpr int BK = 32;
+  const int N = p.N, nb = p.nb;
+  const float scale2 = p.scale * M_LOG2E_F;
+  const int qb = int(threadgroup_position_in_grid.x);
+  const int h = int(threadgroup_position_in_grid.y);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int q0 = qb * BQ + sg * kU;
+  const int lim_q = max(N - q0, 0);  // no early return: the tile loop has threadgroup barriers
+  const int qld = int(p.in_s_t), kld = int(p.in_s_t), vld = int(p.in_s_t);
+  const device bfloat16_t* Qp = q + int64_t(h) * p.in_s_h + int64_t(min(q0, N - 1)) * p.in_s_t;
+  const device bfloat16_t* Kb = k + int64_t(h) * p.in_s_h;
+  const device bfloat16_t* Vb = v + int64_t(h) * p.in_s_h;
+  const ulong bh = ulong(h);
+  const device bfloat16_t* KC = kc + bh * nb * BD;
+  const device bfloat16_t* VC = vc + bh * nb * BD;
+  const device uint8_t* R = route + (bh * nb + qb) * nb;
+  NAXTile<float, 1, BD / kU> Ot;
+  Ot.clear();
+  metal::vec<float, 2> max_score = Limits<float>::finite_min;
+  metal::vec<float, 2> sum_score = 0.0f;
+  const device int* IDX = kidx + (bh * nb + qb) * nb;
+  const int cnt = kcnt[bh * nb + qb];
+  const int tail_block = (N % 64) ? nb - 1 : -1;
+  bool tail = false;
+  _Pragma("clang loop unroll(disable)")
+  for (int i = 0; i < 2 * cnt; i++) {
+    const int kb = IDX[i >> 1];
+    if (kb == tail_block) { tail = true; continue; }
+    const int k0 = kb * 64 + (i & 1) * BK;
+    h3_sol_tile<false, false, BD>(Kb + int64_t(k0) * kld, Vb + int64_t(k0) * vld, kld, vld, BK, 0, nb, N, R,
+                                  scale2, Qp, qld, lim_q, Ot, max_score, sum_score);
+  }
+  if (tail) {
+    const int k0 = tail_block * 64;
+    for (int t = 0; t < 64; t += BK) {
+      const int rem = N - (k0 + t);
+      if (rem <= 0) { break; }
+      h3_sol_tile<false, true, BD>(Kb + int64_t(k0 + t) * kld, Vb + int64_t(k0 + t) * vld, kld, vld,
+                                   min(rem, BK), 0, nb, N, R, scale2, Qp, qld, lim_q, Ot, max_score, sum_score);
+    }
+  }
+  _Pragma("clang loop unroll(disable)")
+  for (int c0 = 0; c0 < nb; c0 += BK) {
+    bool any = false;
+    for (int c = c0; c < min(c0 + BK, nb); c++) { any = any || !R[c]; }
+    if (!any) { continue; }
+    h3_sol_tile<true, true, BD>(KC + c0 * BD, VC + c0 * BD, BD, BD, min(nb - c0, BK), c0, nb, N, R,
+                                scale2, Qp, qld, lim_q, Ot, max_score, sum_score);
+  }
+  metal::vec<float, 2> rcp = 1.0f / sum_score;
+  Ot.template row_bin_op<MulOp>(rcp);
+  if (lim_q <= 0) { return; }
+  device bfloat16_t* Op = out + int64_t(h) * p.out_s_h + int64_t(q0) * p.out_s_t;
+  const int old = int(p.out_s_t);
+  if (lim_q < kU) { Ot.store_rows(Op, old, short(lim_q)); } else { Ot.store(Op, old); }
+}
+
+template [[host_name("h3_sol_attention_bd128")]] [[kernel]] decltype(h3_sol_attention<128>) h3_sol_attention<128>;
+
+
+// ===== int8 QK^T attention (SageAttention-style), opt-in H3_INT8_ATTN=1 =====
+// K is smoothed (per-head mean over tokens subtracted: softmax-invariant), Q and K are quantised to int8 with one
+// scale per 16 tokens of a head, S = (Qi8 Ki8^T) * sq * sk runs on the int8 NAX path, P.V stays bf16.
+struct h3_sage_params {
+  int H, N, Npad, D;
+  int64_t in_s_h, in_s_t;
+  int64_t out_s_h, out_s_t;
+  float scale;
+};
+
+// grid (D, H) threads: per-head key mean over tokens
+kernel void h3_sage_kmean(const device bfloat16_t* k [[buffer(0)]], device float* kmean [[buffer(1)]],
+                          constant h3_sage_params& p [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+  const int d = gid.x, h = gid.y;
+  if (d >= p.D || h >= p.H) return;
+  const device bfloat16_t* src = k + int64_t(h) * p.in_s_h + d;
+  float s = 0.0f;
+  for (int t = 0; t < p.N; t++) s += float(src[int64_t(t) * p.in_s_t]);
+  kmean[h * p.D + d] = s / float(p.N);
+}
+
+// threadgroup (D = 128 threads) per (16-token group g, head h): int8 [H, Npad, D] + scale [H, Npad / 16]
+kernel void h3_sage_quant(const device bfloat16_t* x [[buffer(0)]], const device float* mean [[buffer(1)]],
+                          device int8_t* xi [[buffer(2)]], device float* xs [[buffer(3)]],
+                          constant h3_sage_params& p [[buffer(4)]], constant int& smooth [[buffer(5)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  const int g = tg.x, h = tg.y;
+  threadgroup float red[4];
+  float vals[16];
+  float m = 0.0f;
+  const float mu = smooth ? mean[h * p.D + d] : 0.0f;
+  for (int i = 0; i < 16; i++) {
+    const int t = g * 16 + i;
+    const float v = t < p.N ? float(x[int64_t(h) * p.in_s_h + int64_t(t) * p.in_s_t + d]) - mu : 0.0f;
+    vals[i] = v;
+    m = max(m, fabs(v));
+  }
+  m = simd_max(m);
+  if (lane == 0) red[sg] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  m = max(max(red[0], red[1]), max(red[2], red[3]));
+  const float s = m > 0.0f ? m / 127.0f : 1.0f;
+  const float inv = 1.0f / s;
+  device int8_t* dst = xi + (int64_t(h) * p.Npad + g * 16) * p.D + d;
+  for (int i = 0; i < 16; i++) dst[i * p.D] = int8_t(clamp(rint(vals[i] * inv), -127.0f, 127.0f));
+  if (d == 0) xs[h * (p.Npad / 16) + g] = s;
+}
+
+typedef metal::vec<int8_t, 8> h3_i8x8;
+typedef metal::vec<int32_t, 8> h3_i32x8;
+
+METAL_FUNC void h3_mma_i8(thread h3_i32x8& c0, thread h3_i32x8& c1, thread const h3_i8x8& a,
+                          thread const h3_i8x8& b0, thread const h3_i8x8& b1) {
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto ca = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  auto cb = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  auto cc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>,
+                                                          metal::remove_addrspace_t<decltype(cb)>, int32_t>();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < 8; i++) { ca[i] = a[i]; cb[i] = b0[i]; cb[8 + i] = b1[i]; cc[i] = c0[i]; cc[8 + i] = c1[i]; }
+  op.run(ca, cb, cc);
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < 8; i++) { c0[i] = cc[i]; c1[i] = cc[8 + i]; }
+}
+
+// 16x16 int8 fragment: rows fm, fm + 8, columns fn .. fn + 3 (the NAX bf16 fragment layout)
+METAL_FUNC void h3_load_i8(thread h3_i8x8& f, const device int8_t* src, int ld, short fm, short fn) {
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < 2; i++) {
+    const char4 x = *(const device char4*)(src + (fm + 8 * i) * ld + fn);
+    f[i * 4 + 0] = x[0]; f[i * 4 + 1] = x[1]; f[i * 4 + 2] = x[2]; f[i * 4 + 3] = x[3];
+  }
+}
+
+// threadgroups (Npad / 64, H), threads (32, 4, 1)
+template <int BD>
+[[kernel, max_total_threads_per_threadgroup(128)]] void h3_sage_attention(
+    const device int8_t* qi [[buffer(0)]], const device int8_t* ki [[buffer(1)]],
+    const device bfloat16_t* v [[buffer(2)]], device bfloat16_t* out [[buffer(3)]],
+    const device float* qs [[buffer(4)]], const device float* ks [[buffer(5)]],
+    constant h3_sage_params& p [[buffer(6)]],
+    uint sgid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint3 tgp [[threadgroup_position_in_grid]]) {
+  typedef bfloat16_t T;
+  constexpr short kU = 16;
+  constexpr short TD = BD / kU;
+  constexpr int BQ = 64;
+  constexpr int BK = 32;
+  constexpr float neg_inf = Limits<float>::finite_min;
+  const int N = p.N, Npad = p.Npad;
+  const float scale2 = p.scale * M_LOG2E_F;
+  const int h = int(tgp.y);
+  const int q0 = int(tgp.x) * BQ + int(sgid) * kU;
+  const int lim_q = max(N - q0, 0);
+  const short qid = lane >> 2;
+  const short fm = ((qid & 4) | ((lane >> 1) & 3));
+  const short fn = ((qid & 2) | (lane & 1)) * 4;
+  const device int8_t* Qp = qi + (int64_t(h) * Npad + q0) * BD;
+  const device int8_t* Kb = ki + int64_t(h) * Npad * BD;
+  const device T* Vb = v + int64_t(h) * p.in_s_h;
+  const int vld = int(p.in_s_t);
+  const float qsc = qs[h * (Npad / 16) + q0 / 16] * scale2;
+  const device float* ksh = ks + h * (Npad / 16);
+  h3_i8x8 Qf[TD];
+  STEEL_PRAGMA_UNROLL
+  for (short id = 0; id < TD; id++) h3_load_i8(Qf[id], Qp + id * kU, BD, fm, fn);
+  NAXTile<float, 1, TD> Ot;
+  Ot.clear();
+  metal::vec<float, 2> max_score = Limits<float>::finite_min;
+  metal::vec<float, 2> sum_score = 0.0f;
+  using stile_t = NAXTile<float, 1, 2>;
+  const short sn = stile_t::NAXFrag_t::get_coord().x;
+  _Pragma("clang loop unroll(disable)")
+  for (int k0 = 0; k0 < N; k0 += BK) {
+    h3_i32x8 A0 = 0, A1 = 0;
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id++) {
+      h3_i8x8 K0, K1;
+      h3_load_i8(K0, Kb + int64_t(k0) * BD + id * kU, BD, fm, fn);
+      h3_load_i8(K1, Kb + int64_t(k0 + 16) * BD + id * kU, BD, fm, fn);
+      h3_mma_i8(A0, A1, Qf[id], K0, K1);
+    }
+    const float s0 = qsc * ksh[k0 / 16], s1 = qsc * ksh[k0 / 16 + 1];
+    stile_t S;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 8; i++) { S.frag_at(0, 0)[i] = float(A0[i]) * s0; S.frag_at(0, 1)[i] = float(A1[i]) * s1; }
+    const int rem = N - k0;
+    if (rem < BK) {
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < 2; ik++) {
+        STEEL_PRAGMA_UNROLL
+        for (short ii = 0; ii < 2; ii++) {
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < 4; jj++) {
+            if (ik * kU + sn + jj >= rem) S.frag_at(0, ik)[ii * 4 + jj] = neg_inf;
+          }
+        }
+      }
+    }
+    metal::vec<float, 2> new_max = max_score;
+    S.template row_reduce<MaxOp>(new_max);
+    S.template row_bin_op<ExpSubOp>(new_max);
+    metal::vec<float, 2> factor;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < 2; ++i) {
+      factor[i] = fast::exp2(max_score[i] - new_max[i]);
+      max_score[i] = new_max[i];
+      sum_score[i] *= factor[i];
+    }
+    S.template row_reduce<SumOp>(sum_score);
+    Ot.template row_bin_op<MulOp>(factor);
+    simdgroup_barrier(mem_flags::mem_none);
+    STEEL_PRAGMA_UNROLL
+    for (short id = 0; id < TD; id += 2) {
+      if (BD == 128 && id == 4) { threadgroup_barrier(mem_flags::mem_none); }
+      STEEL_PRAGMA_UNROLL
+      for (short ik = 0; ik < 2; ik++) {
+        NAXTile<T, 1, 2> Vt;
+        const device T* vsrc = Vb + int64_t(k0 + ik * kU) * vld + id * kU;
+        if (rem < BK) { Vt.load_rows(vsrc, vld, short(rem - ik * kU)); } else { Vt.load(vsrc, vld); }
+        NAXTile<float, 1, TD>::NAXFrag_t::mma(Ot.frag_at(0, id), Ot.frag_at(0, id + 1), S.frag_at(0, ik),
+                                               metal::false_type{}, Vt.frag_at(0, 0), Vt.frag_at(0, 1),
+                                               metal::false_type{});
+      }
+    }
+  }
+  metal::vec<float, 2> rcp = 1.0f / sum_score;
+  Ot.template row_bin_op<MulOp>(rcp);
+  if (lim_q <= 0) { return; }
+  device T* Op = out + int64_t(h) * p.out_s_h + int64_t(q0) * p.out_s_t;
+  if (lim_q < kU) { Ot.store_rows(Op, int(p.out_s_t), short(lim_q)); } else { Ot.store(Op, int(p.out_s_t)); }
+}
+
+template [[host_name("h3_sage_attention_bd128")]] [[kernel]] decltype(h3_sage_attention<128>) h3_sage_attention<128>;

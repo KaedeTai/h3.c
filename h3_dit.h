@@ -130,6 +130,9 @@ void h3_dit_set_audio_anchor(h3_dit *dit, const float *anchor);
 float h3_dit_sigma_at(const h3_dit *dit, int step);
 void h3_dit_set_start_step(h3_dit *dit, int step);
 
+/* Seed for samplers that draw noise mid-trajectory (H3_RENOISE). */
+void h3_dit_set_noise_seed(h3_dit *dit, uint64_t seed);
+
 int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,

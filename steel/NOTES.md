@@ -1046,3 +1046,42 @@ now sets the VAE flag by default and leaves steel opt-in.
 the GPU sampler keeps latents on device, and the M5 default is the GPU one -- but
 controlled, same everything else, GPU sampler 73.4 s against host 73.3 s. No
 reason to port the anchor to the GPU path.
+
+## Sol-Attn block-sparse attention and int8 QK attention (2026-10-09)
+
+Both opt-in, both in `steel/h3_steel_attention.metal` (loaded when `H3_STEEL_ATTN`, `H3_SOL_TAU` or
+`H3_INT8_ATTN` is set), DiT attention only (head_dim 128, >= 4096 tokens).
+
+**`H3_SOL_TAU=tau[,tau...]`** (one per step, last repeats; `H3_SOL_DENSE_LAYERS`, default 1 = block 0 dense).
+Port of sol-refiner-mlx `sparse_nax.py`: NVIDIA Sol-Attn routing per 64-token block (centroid score above
+mean + tau*std, |i-j| <= 1, previous/next video frame), skipped blocks as one centroid key with a log2(len) bias
+and their value mean. Text and audio tokens ([0, video_target_start)) stay dense as rows and as columns. Routing
+(`h3_sol_block_sums`, `h3_sol_kstats`, `h3_sol_route`) and the attention (`h3_sol_attention_bd128`, MLX NAX loop
+over a compact routed-block list) run on the GPU. Everything routed (`H3_SOL_TAU=-1000`) is bit-identical to
+the steel dense path (PSNR inf on a 73-frame render).
+
+672x384, 124 frames, turbo 4 steps, denoise wall (busy machine, same session order):
+
+| | p3 dance | p1 cafe |
+|---|---|---|
+| dense (steel) | 33.6 s | 36.9 s |
+| tau 1.0 every step | 26.8 s | 25.5 s |
+| step 1 dense, then tau 1.0 (`-1000,1.0`) | 28.2 s | 28.5 s |
+
+The generator is not a refiner: a different attention in step 1 gives a different sample (PSNR vs dense
+15.5-17.3 dB) - same prompt, same kind of shot, another choreography / framing. No broken frames in the contact
+sheets; tau 1.0 everywhere smears the dancer's limbs more than dense or `-1000,1.0`. At 672x384 attention is
+only ~27 % of a step, so the ceiling is small; at 896x512 (59 %) it is larger.
+
+**`H3_INT8_ATTN=1`**: SageAttention-style. K smoothed (per-head mean subtracted, softmax-invariant), Q and K
+quantised per 16 tokens of a head (`h3_sage_kmean`, `h3_sage_quant`), S = Qi8 Ki8^T on the int8 NAX path
+(16x32x16 int8 cooperative matmul, fragment layout = the bf16 NAX one), P.V bf16. Isolated kernel (MLX
+prototype, 56x16384x128): 172 ms vs 251 ms dense, rel. error 1.2e-2 vs fp32 (bf16 SDPA 1.7e-3). In h3:
+672x384 no gain (36.3 vs 34.3 s; quantisation passes eat it at 9.7k tokens), 896x512 76.7 s vs 88.0 s. Keeps the
+dense sample's choreography (PSNR vs dense 17-20 dB but visibly the same shot), unlike Sol.
+
+**Video VAE tiles**: bigger tiles do not pay. 672x384 at 384 px tiles: 11.3 s vs 14.2 s, but the decoder breaks
+up (blocky texture); 896x512 at 512 px: no faster and garbage. Keep the automatic <= 320 px tiles.
+
+**Draft resolution**: the SoL refiner reads its input at half the output canvas (672x384 for 768p), so a 768p
+pipeline should draft at 672x384: denoise 88 -> 40 s, draft 121 -> 68-76 s (`~/bin/h3sol` does this).

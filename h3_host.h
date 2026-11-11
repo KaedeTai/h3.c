@@ -10,7 +10,11 @@
 #define H3_AUDIO_LATENT_FPS 40
 #define H3_VAE_SPATIAL_RATIO 16
 #define H3_VIDEO_SIGMA_SHIFT 12.0
-#define H3_AUDIO_SIGMA_SHIFT 3.0
+/* Audio shift of the released grid is 3.0. DMAD's 4-step students were
+   trained with 2.0; H3_AUDIO_SIGMA_SHIFT overrides it at run time. */
+#define H3_AUDIO_SIGMA_SHIFT_DEFAULT 3.0
+double h3_audio_sigma_shift(void);
+#define H3_AUDIO_SIGMA_SHIFT (h3_audio_sigma_shift())
 #define H3_MAX_STEPS 1000
 
 typedef struct {

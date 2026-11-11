@@ -1912,6 +1912,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_dit_set_audio_anchor(dit, audio_anchor);
+    h3_dit_set_noise_seed(dit, (uint64_t)params->seed);
     if (video_init_sigma > 0.0f) {
         if (!still_latent || still_lh != latent_h || still_lw != latent_w) {
             h3_set_error(ctx, "H3_VIDEO_INIT_SIGMA needs a single-image "

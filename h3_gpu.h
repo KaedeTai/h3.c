@@ -527,6 +527,11 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);
+/* Run the NEXT bf16 SDPA call (head_dim 128, >= 4096 tokens, steel library loaded) as Sol-Attn block-sparse
+ * attention with routing threshold `tau`; tokens [0, dense_end) (text, audio) stay dense both ways and
+ * `tokens_per_frame` adds the previous/next video frame as exact neighbours. The flag is consumed by that call. */
+void h3_gpu_set_sol(h3_gpu *gpu, int enabled, float tau, uint32_t dense_end,
+                    uint32_t tokens_per_frame);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
