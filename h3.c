@@ -1060,6 +1060,26 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
+    /* HyperFlow H3 Flash (hyperflow.json beside the DiT) decodes with the int8 video-VAE FFN by
+       default: 5x faster decode, no difference occamy could find in blind A/B at 768p.
+       H3_VAE_INT8_FFN=0 keeps the BF16/F32 decoder. */
+    {
+        static int vae_int8_auto = 0; /* set by us, so a later non-HyperFlow run in this process drops it */
+        size_t length = strlen(dit_path) + sizeof("/hyperflow.json");
+        char *marker = malloc(length);
+        if (marker) {
+            snprintf(marker, length, "%s/hyperflow.json", dit_path);
+            int hyperflow = h3_is_file(marker);
+            if (hyperflow && !getenv("H3_VAE_INT8_FFN")) {
+                setenv("H3_VAE_INT8_FFN", "1", 0);
+                vae_int8_auto = 1;
+            } else if (!hyperflow && vae_int8_auto) {
+                unsetenv("H3_VAE_INT8_FFN");
+                vae_int8_auto = 0;
+            }
+            free(marker);
+        }
+    }
     conditioning_key = h3_conditioning_key(
         prompt, params, render_width, render_height, ref2va);
     if (!conditioning_key) {

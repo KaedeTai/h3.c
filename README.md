@@ -472,25 +472,55 @@ inactive (on top of `--layers`), `endpoint_time_embedder.*` switches the AdaLN
 table to one row per `(t, r)` pair (computed on the host in double -- the
 embedding cancels heavily), and `hyperflow.json` beside the weights selects
 the step grid. `--steps` must be 4, 6 or 8; `H3_SIGMA_BASE` still overrides.
+HyperFlow decodes with the int8 video-VAE FFN by default (`H3_VAE_INT8_FFN=0`
+restores the BF16/F32 decoder): at 1344x768x124 the decode drops from 141-144 s
+to 28-29 s, and blind occamy A/B against the default decoder found no difference.
+Turbo and base bundles are unaffected.
+
+Recommended: `--steps 6` for finals, `--steps 4` for drafts; no other knobs.
+
+All numbers below: M5 Max, High Power, 2 min idle before each run, nothing else
+on the GPU (oMLX idle), seed 42. Quality is blind occamy A/B, each pair shown in
+both left/right orders; a verdict counts only when both orders agree.
+
+Speed options, 1344x768x124, HyperFlow 6 steps, three prompts:
+
+| option | DiT a step | quality against the default |
+|---|---|---|
+| default | 67 s | - |
+| `--use-int8-row-fc2` | 66.6 s | same (one prompt) |
+| `H3_INT8_ATTN=1` | 58 s | lost both orders on a face |
+| `H3_SOL_TAU=1.0` (`-1000,1.0`) | 30 s (40 s) | lost both orders: limbs deform, softer |
+| `--steps 4` | 2/3 of 6 steps | 1 win, 1 split, 1 loss; a different shot, not a clear loss |
+
+Against h3 turbo-int8 (4 steps, its weights read from an external SSD), same
+prompts and seed, int8 video VAE on both:
+
+| | HyperFlow 6 | HyperFlow 4 | turbo 4 |
+|---|---|---|---|
+| 1344x768x124 t2va, end to end | 452-478 s | 317-329 s | 371-390 s |
+| 608x352x124 FL2VA + first frame | 50 s | 40 s | 88 s |
+| line "歡迎光臨，今天想喝點什麼呢" (whisper) | 想咖啡帶你什麼呢 | 想聊點什麼 | exact |
+| line "這家的鹹酥雞超好吃，你一定要試試看" | 鹹酥精 | garbled | exact |
+| picture, pairs agreeing both orders | turbo 2, HyperFlow 1 | turbo 2, HyperFlow 1 | - |
+| transformer on disk | 19 GB | 19 GB | 44 GB |
+
+So HyperFlow does not replace turbo: the picture is about level, turbo speaks
+its lines more reliably, and only HyperFlow 4 steps is faster at 768p. Its
+gains are the smaller checkpoint and the short 608x352 shots.
 
 Checked against the official diffusers block with HyperFlow's own linears and
 against an MLX port (`~/repos/hyperflow-h3-mlx`). From the same noise and
 text, h3's 6-step result differs from the MLX bf16 run by 19% (video latent,
 relative L2) and 16% (audio); the MLX run differs from itself at fp32 by 28%
 and 10%, so a 6-step trajectory is about that sensitive to arithmetic.
-M5 Max, 6 steps: 512x288x56 denoise 11.1 s; FL2VA 608x352x124 denoise 54.4 s
-(118 s end to end, 10.8 GB peak footprint); 1344x768x124 denoise 704 s
-(950 s end to end, 12.8 GB) in one sustained run. Started cool (2 min idle,
-2 steps) the same 1344x768x124 step takes 82.6 s, of which 67.5 s is the 47
-attentions over 37,730 tokens (1.44 s each, 28 TFLOPS) and 15.2 s everything
-else; the 117 s a step of the long run is most likely the machine heating up.
-The MLX port, measured the same way, takes 89-95 s a step and 36.5 GB, and
-17 s a step at 608x352x124 (h3: 9). The attention kernels are not the
-difference: `tools/bench/sdpa_bench.c` times the default MPSGraph path at
-1.39-1.45 s for N=37730, 56x128, and the steel NAX path (`H3_STEEL_ATTN=1`,
-the same source as MLX 0.32.2's steel_attention_nax) at 1.50-1.73 s, against
-1.51 s for MLX's own SDPA at 38,912 tokens. At 1344x768 `H3_STEEL_ATTN=1` (127 s a step in the
-sustained run) and `H3_INT8_ATTN=1` (140 s) stay slower than the default.
+Attention is about four fifths of a 768p step (37,730 tokens, 47 blocks). The
+kernels are already at MLX's rate: `tools/bench/sdpa_bench.c` times the default
+MPSGraph path at 1.39-1.45 s for N=37730, 56x128 and the steel NAX path
+(`H3_STEEL_ATTN=1`, the same source as MLX 0.32.2's steel_attention_nax) at
+1.50-1.73 s, against 1.51 s for MLX's own SDPA at 38,912 tokens. The MLX port
+runs a 768p step at 89-95 s against h3's 82.6 s, both measured while another
+process was using the GPU.
 
 ## Tests and runtime requirements
 
